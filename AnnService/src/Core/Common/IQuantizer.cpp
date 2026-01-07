@@ -1,6 +1,7 @@
 #include <inc/Core/Common/IQuantizer.h>
 #include <inc/Core/Common/PQQuantizer.h>
 #include <inc/Core/Common/OPQQuantizer.h>
+#include <inc/Core/Common/RaBitQQuantizer.h>
 #include <inc/Helper/StringConvert.h>
 
 namespace SPTAG
@@ -33,6 +34,11 @@ namespace SPTAG
                 default: break;
                 }
                 
+                if (ret->LoadQuantizer(p_in) != ErrorCode::Success) ret.reset();
+                return ret;
+            case QuantizerType::RaBitQQuantizer:
+                // RaBitQQuantizer is not templated by reconstruct type; it reconstructs float by design.
+                ret.reset(new RaBitQQuantizer());
                 if (ret->LoadQuantizer(p_in) != ErrorCode::Success) ret.reset();
                 return ret;
             case QuantizerType::OPQQuantizer:
@@ -80,6 +86,10 @@ namespace SPTAG
                 default: break;
                 }
 
+                if (ret->LoadQuantizer(raw_bytes) != ErrorCode::Success) ret.reset();
+                return ret;
+            case QuantizerType::RaBitQQuantizer:
+                ret.reset(new RaBitQQuantizer());
                 if (ret->LoadQuantizer(raw_bytes) != ErrorCode::Success) ret.reset();
                 return ret;
             case QuantizerType::OPQQuantizer:

@@ -35,25 +35,18 @@ namespace SPTAG
         class RaBitQQuantizer : public IQuantizer
         {
         public:
+            RaBitQQuantizer() : m_Dim(0), m_PaddedDim(0), m_CodeSize(0), m_MetaSize(3 * sizeof(float)), m_QuantizedSize(0)
+            {
+            }
+
             RaBitQQuantizer(DimensionType dim) : m_Dim(dim)
             {
-                // RaBitQ requires padding to 256 bits (32 bytes) or similar alignment usually
-                // For now, let's assume dim is compatible or handled by external padding
-                m_PaddedDim = (dim + 127) / 128 * 128; // Example alignment, adjust based on rabitq reqs
-                if (m_PaddedDim < dim) m_PaddedDim = dim; // overflow check
-                
-                // RaBitQ Code size: Dim bits -> Dim/8 bytes
-                m_CodeSize = m_PaddedDim / 8;
-                
-                // Metadata: f_add(float), f_rescale(float), f_error(float)
-                m_MetaSize = 3 * sizeof(float);
-                
-                m_QuantizedSize = m_CodeSize + m_MetaSize;
+                RecalcSizes();
             }
 
             virtual ~RaBitQQuantizer() {}
 
-            virtual QuantizerType GetQuantizerType() const { return QuantizerType::None; } // TODO: Define new type if needed
+            virtual QuantizerType GetQuantizerType() const { return QuantizerType::RaBitQQuantizer; }
             virtual VectorValueType GetReconstructType() const { return VectorValueType::Float; }
 
             virtual SizeType QuantizeSize() const { return m_QuantizedSize; }
@@ -142,12 +135,14 @@ namespace SPTAG
             virtual ErrorCode LoadQuantizer(std::shared_ptr<Helper::DiskIO> p_in) 
             {
                 IOBINARY(p_in, ReadBinary, sizeof(DimensionType), (char*)&m_Dim);
+                RecalcSizes();
                 return ErrorCode::Success;
             }
 
             virtual ErrorCode LoadQuantizer(uint8_t* raw_bytes) 
             {
                 m_Dim = *(reinterpret_cast<DimensionType*>(raw_bytes));
+                RecalcSizes();
                 return ErrorCode::Success;
             }
 
@@ -178,6 +173,16 @@ namespace SPTAG
             virtual float CosineDistance(const std::uint8_t* pX, const std::uint8_t* pY) const { return 0.0f; }
 
         private:
+            inline void RecalcSizes()
+            {
+                // RaBitQ requires padded bits. Example alignment: 128 for simplicity (adjust if needed).
+                m_PaddedDim = (m_Dim + 127) / 128 * 128;
+                if (m_PaddedDim < m_Dim) m_PaddedDim = m_Dim;
+
+                m_CodeSize = m_PaddedDim / 8; // bits -> bytes
+                m_MetaSize = 3 * sizeof(float);
+                m_QuantizedSize = m_CodeSize + m_MetaSize;
+            }
             DimensionType m_Dim;
             DimensionType m_PaddedDim;
             SizeType m_CodeSize;
