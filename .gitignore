@@ -465,3 +465,15 @@ FodyWeavers.xsd
 
 # Ignore dataset files
 /datasets/
+
+# Ignore RaBitQ sample data
+RaBitQ_sample/
+
+# Test generated folders
+real_idx/
+rec_idx/
+sddtest/
+SPANN/
+testindices/
+zbtest/
+quan_idx/

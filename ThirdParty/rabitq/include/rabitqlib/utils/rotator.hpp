@@ -313,7 +313,7 @@ Rotator<T>* choose_rotator(
     }
 
     if (type == RotatorType::FhtKacRotator) {
-        if (!std::is_same_v<T, float>) {
+        if (!std::is_same<T, float>::value) {   //½â¾ö±¨´í
             std::cerr << "FhtKacRotator is only for float type currently\n";
             exit(1);
         }

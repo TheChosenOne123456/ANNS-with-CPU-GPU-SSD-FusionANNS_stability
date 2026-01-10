@@ -6,6 +6,11 @@
 #include "inc/Core/VectorIndex.h"
 #include "inc/Core/Common/CommonUtils.h"
 
+#include "inc/Core/Common/RaBitQQuantizer.h" // 【新增】添加这一行
+// 【新增】为了直接测试 RaBitQ 库的底层逻辑，引入这些头文件
+#include "rabitqlib/quantization/rabitq.hpp"
+#include "rabitqlib/utils/rotator.hpp"
+
 #include <unordered_set>
 #include <chrono>
 
@@ -240,6 +245,131 @@ BOOST_AUTO_TEST_CASE(BKTTest)
 BOOST_AUTO_TEST_CASE(SPANNTest)
 {
     Test<float>(SPTAG::IndexAlgoType::SPANN, "L2");
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// // 【新增】以下全部添加到文件末尾
+// BOOST_AUTO_TEST_SUITE(RaBitQSanityCheck)
+
+// BOOST_AUTO_TEST_CASE(CanCreateRaBitQ)
+// {
+//     // 验证能否成功创建一个 RaBitQQuantizer 对象
+//     auto q = std::make_shared<SPTAG::COMMON::RaBitQQuantizer>();
+//     BOOST_CHECK(q != nullptr);
+    
+//     // 【修改】强制转换为 int 进行比较
+//     BOOST_CHECK_EQUAL((int)q->GetQuantizerType(), (int)SPTAG::QuantizerType::RaBitQQuantizer);
+
+//     std::cout << "SUCCESS: RaBitQQuantizer created successfully!" << std::endl;
+// }
+
+// BOOST_AUTO_TEST_CASE(CanSaveAndLoadRaBitQConfig)
+// {
+//     // 验证 IQuantizer 工厂能否正确识别保存的 RaBitQ 类型
+//     std::stringstream ss;
+//     SPTAG::QuantizerType type = SPTAG::QuantizerType::RaBitQQuantizer;
+//     SPTAG::SizeType size = 0; // 模拟空大小
+//     ss.write((char*)&type, sizeof(SPTAG::QuantizerType));
+//     ss.write((char*)&size, sizeof(SPTAG::SizeType));
+
+//     // 2. 模拟加载
+//     ss.seekg(0, std::ios::beg);
+//     SPTAG::QuantizerType loadedType;
+//     ss.read((char*)&loadedType, sizeof(SPTAG::QuantizerType));
+    
+//     std::shared_ptr<SPTAG::COMMON::IQuantizer> quantizer;
+//     if (loadedType == SPTAG::QuantizerType::RaBitQQuantizer)
+//     {
+//         quantizer = std::make_shared<SPTAG::COMMON::RaBitQQuantizer>();
+//     }
+
+//     BOOST_CHECK(quantizer != nullptr);
+    
+//     // 【修改】强制转换为 int 进行比较
+//     BOOST_CHECK_EQUAL((int)quantizer->GetQuantizerType(), (int)SPTAG::QuantizerType::RaBitQQuantizer);
+
+//     std::cout << "SUCCESS: RaBitQQuantizer factory logic verified!" << std::endl;
+// }
+
+// BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_AUTO_TEST_SUITE(RaBitQSanityCheck)
+
+// 基础验证：对象创建
+BOOST_AUTO_TEST_CASE(CanCreateRaBitQ)
+{
+    auto q = std::make_shared<SPTAG::COMMON::RaBitQQuantizer>();
+    BOOST_CHECK(q != nullptr);
+    BOOST_CHECK_EQUAL((int)q->GetQuantizerType(), (int)SPTAG::QuantizerType::RaBitQQuantizer);
+}
+
+// 核心验证：使用 RaBitQQuantizer 类进行高精度测试 (Wrapper Class Test)
+BOOST_AUTO_TEST_CASE(VerifyRaBitQWrapperAccuracy)
+{
+    std::cout << "\n[RaBitQ] Starting Wrapper Class Accuracy Test (Expect 4-bit precision)..." << std::endl;
+
+    int dim = 128;
+    int n = 100; // 训练样本数
+
+    // 1. 创建并训练 Quantizer
+    // 注意：RaBitQ Train 主要用于选择 Rotator，不涉及聚类
+    std::shared_ptr<SPTAG::COMMON::RaBitQQuantizer> quantizer = std::make_shared<SPTAG::COMMON::RaBitQQuantizer>(dim);
+    
+    // 生成模拟训练数据
+    std::vector<float> data(n * dim);
+    for (int i = 0; i < n * dim; i++) {
+        data[i] = (float)(rand() % 1000) / 1000.0f;
+    }
+    quantizer->Train(data.data(), n);
+
+    // 2. 准备测试向量 vecA 和 vecB
+    std::vector<float> vecA(dim), vecB(dim);
+    for (int i = 0; i < dim; i++) {
+        vecA[i] = (float)(rand() % 1000) / 1000.0f;
+        vecB[i] = (float)(rand() % 1000) / 1000.0f;
+    }
+
+    // 3. 执行量化
+    int qSize = quantizer->QuantizeSize();
+    std::vector<uint8_t> qA(qSize), qB(qSize);
+    
+    quantizer->QuantizeVector(vecA.data(), qA.data());
+    quantizer->QuantizeVector(vecB.data(), qB.data());
+
+    // 4. 计算距离
+    // A. 真实距离
+    float trueDist = SPTAG::COMMON::DistanceUtils::ComputeL2Distance(vecA.data(), vecB.data(), dim);
+
+    // B. 对称距离 (Wrapped SD): qA vs qB
+    float sdDist = quantizer->L2Distance(qA.data(), qB.data());
+
+    // C. 非对称距离 (Wrapped ADC): vecA vs qB
+    float adcDist = quantizer->L2Distance(vecA.data(), qB.data());
+
+    // 5. 打印对比
+    std::cout << "[RaBitQ Wrap] Dimension: " << dim << " (Padded inside: " << quantizer->QuantizeSize() - 8 << ")" << std::endl;
+    std::cout << "[RaBitQ Wrap] True L2 Dist : " << trueDist << std::endl;
+    std::cout << "[RaBitQ Wrap] Wrapper SD   : " << sdDist << std::endl;
+    std::cout << "[RaBitQ Wrap] Wrapper ADC  : " << adcDist << std::endl;
+
+    // 6. 验证精度 (针对 4-bit 精度预期)
+    float error_sd = std::abs(trueDist - sdDist) / trueDist * 100.0f;
+    float error_adc = std::abs(trueDist - adcDist) / trueDist * 100.0f;
+    
+    std::cout << "[RaBitQ Wrap] SD Error     : " << error_sd << "%" << std::endl;
+    std::cout << "[RaBitQ Wrap] ADC Error    : " << error_adc << "%" << std::endl;
+
+    // 这里的阈值设为 15% (之前通过 direct lib 测试大约是 5%)
+    // 如果封装正确，误差应该差不多
+    bool passed = (error_sd < 15.0f);
+    
+    if (passed) {
+        std::cout << "[Pass] RaBitQQuantizer wrapper works perfectly!" << std::endl;
+    } else {
+        std::cout << "[Fail] Wrapper error too high. Implementation mismatch?" << std::endl;
+    }
+    BOOST_CHECK(passed);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

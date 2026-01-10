@@ -6,6 +6,18 @@
 #include <thread>
 #include <type_traits>
 
+// ---- Ìí¼Ó¿ªÊ¼ ----
+// Polyfill for C++14 compatibility
+#if __cplusplus < 201703L
+namespace std {
+    template <class T>
+    constexpr bool is_integral_v = is_integral<T>::value;
+    
+    template <class T>
+    constexpr bool is_floating_point_v = is_floating_point<T>::value;
+}
+#endif
+
 namespace rabitqlib {
 template <typename T>
 inline void assert_integral() {

@@ -1,19 +1,10 @@
 /************************************************************
  *  ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
- *  ★                                                      ★
- *  ★        RaBitQ EMBEDDED MODULE (毕业设计新增)          ★
- *  ★                                                      ★
- *  ★  Purpose : Integrate RaBitQ into legacy vector search *
- *  ★  Author  : Ruilin                                     *
- *  ★  Date    : 2026-01                                    *
- *  ★                                                      ★
- *  ★  NOTE: This file is NOT part of the original project ★
- *  ★        Added specifically for graduation thesis      ★
- *  ★                                                      ★
+ *  ★        RaBitQ EMBEDDED MODULE (Fixed)                 ★
  *  ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
  ************************************************************/
 
- #ifndef _SPTAG_COMMON_RABITQQUANTIZER_H_
+#ifndef _SPTAG_COMMON_RABITQQUANTIZER_H_
 #define _SPTAG_COMMON_RABITQQUANTIZER_H_
 
 #include "CommonUtils.h"
@@ -22,9 +13,14 @@
 #include <vector>
 #include <cstring>
 #include <cmath>
+#include <memory> 
+#include <iostream>
+#include <limits>
+#include <algorithm>
 
 // RaBitQ Includes
 #include "rabitqlib/quantization/rabitq.hpp"
+#include "rabitqlib/utils/rotator.hpp"
 #include "rabitqlib/index/estimator.hpp"
 
 namespace SPTAG
@@ -35,159 +31,225 @@ namespace SPTAG
         class RaBitQQuantizer : public IQuantizer
         {
         public:
-            RaBitQQuantizer() : m_Dim(0), m_PaddedDim(0), m_CodeSize(0), m_MetaSize(3 * sizeof(float)), m_QuantizedSize(0)
+            RaBitQQuantizer() : m_Dim(0), m_PaddedDim(0), m_CodeSize(0), m_MetaSize(2 * sizeof(float)), m_QuantizedSize(0), m_Rotator(nullptr), m_EnableADC(false)
             {
             }
 
-            RaBitQQuantizer(DimensionType dim) : m_Dim(dim)
+            RaBitQQuantizer(DimensionType dim) : m_Dim(dim), m_Rotator(nullptr), m_EnableADC(false)
             {
                 RecalcSizes();
             }
 
-            virtual ~RaBitQQuantizer() {}
+            virtual ~RaBitQQuantizer() 
+            {
+                if (m_Rotator) delete m_Rotator;
+            }
 
             virtual QuantizerType GetQuantizerType() const { return QuantizerType::RaBitQQuantizer; }
             virtual VectorValueType GetReconstructType() const { return VectorValueType::Float; }
-
-            virtual SizeType QuantizeSize() const { return m_QuantizedSize; }
             
+            // 必须实现
+            virtual SizeType QuantizeSize() const { return m_QuantizedSize; }
             virtual int GetBase() const { return 1; }
             virtual DimensionType GetNumSubvectors() const { return 1; }
-            virtual bool GetEnableADC() const { return false; }
-            virtual void SetEnableADC(bool enableADC) {}
+            
+            virtual bool GetEnableADC() const { return m_EnableADC; } 
+            virtual void SetEnableADC(bool enableADC) { m_EnableADC = enableADC; }
             
             virtual float* GetL2DistanceTables() { return nullptr; }
             template<typename T> T* GetCodebooks() { return nullptr; }
 
-            // Core Quantization Logic
+            void Train(const void* data, SizeType num) 
+            {
+                 if (!m_Rotator) {
+                     m_Rotator = rabitqlib::choose_rotator<float>(m_Dim);
+                     RecalcSizes();
+                 }
+            }
+
+            // 【基于库函数实现的 4-bit 量化】
             virtual void QuantizeVector(const void* vec, std::uint8_t* vecout, bool ADC = true) const
             {
                 const float* fvec = reinterpret_cast<const float*>(vec);
+                std::vector<float> rotated_vec(m_PaddedDim, 0.0f);
                 
-                // Layout: [f_add][f_rescale][f_error][binary_code...]
+                if (m_Rotator) {
+                    m_Rotator->rotate(const_cast<float*>(fvec), rotated_vec.data());
+                } else {
+                    std::memcpy(rotated_vec.data(), fvec, m_Dim * sizeof(float));
+                }
+
                 float* meta_ptr = reinterpret_cast<float*>(vecout);
-                char* bin_ptr = reinterpret_cast<char*>(vecout + m_MetaSize);
+                uint8_t* bin_ptr = reinterpret_cast<uint8_t*>(vecout + m_MetaSize);
                 
-                // Temp variables for metadata
-                float f_add, f_rescale, f_error;
+                float delta = 0;
+                float vl = 0;
                 
-                // If dim != PaddedDim, we might need a temp buffer for padding, 
-                // but let's assume for now input is safe or fastscan handles it.
-                // NOTE: rabitq assumes data might be padded. 
-                // For safety in this MVP, let's use a temp aligned buffer if needed
-                
-                // Call RaBitQ
-                // We assume centroid is 0 for basic usage (or we need to store centroids)
-                // Using 0-centroid effectively quantizes the vector itself.
-                rabitqlib::quant::quantize_compact_one_bit<float>(
-                    fvec, 
-                    m_PaddedDim, // dimension
-                    bin_ptr,     // output binary code
-                    f_add, 
-                    f_rescale, 
-                    f_error
+                // 使用库函数进行 4-bit 量化
+                // 注意：bin_ptr 必须有 padded_dim 大小的空间
+                // m_CodeSize 在 RecalcSizes 里已经调整为 padded_dim
+                rabitqlib::quant::quantize_scalar(
+                    rotated_vec.data(), 
+                    m_PaddedDim, 
+                    4, // Bits
+                    bin_ptr, 
+                    delta, 
+                    vl
                 );
                 
-                // Store metadata
-                meta_ptr[0] = f_add;
-                meta_ptr[1] = f_rescale;
-                meta_ptr[2] = f_error;
+                meta_ptr[0] = delta;
+                meta_ptr[1] = vl;
             }
 
-            // Reconstruction (Reverse Quantization)
             virtual void ReconstructVector(const std::uint8_t* qvec, void* vecout) const 
             {
-                float* out_vec = reinterpret_cast<float*>(vecout);
+                float* out_vec_raw = reinterpret_cast<float*>(vecout);
+                
+                std::vector<float> rotated_reconst(m_PaddedDim);
                 
                 const float* meta_ptr = reinterpret_cast<const float*>(qvec);
-                const char* bin_ptr = reinterpret_cast<const char*>(qvec + m_MetaSize);
+                const uint8_t* bin_ptr = reinterpret_cast<const uint8_t*>(qvec + m_MetaSize);
                 
-                float f_add = meta_ptr[0];
-                float f_rescale = meta_ptr[1];
-                // f_error not typically used for simple reconstruction
-                
-                // Naive reconstruction loop (RaBitQ doesn't seem to expose a simple 'dequantize' for one vector in headers easily)
-                // Logic: value ~ f_add + f_rescale * (bit ? 1 : -1) * ... logic specific to RaBitQ
-                // Let's implement a simple approximation based on RaBitQ paper/logic
-                // x ~ C + s * b  where b is {-1, 1}
-                // Actually RaBitQ usually means: if bit is 1, val > 0. 
-                
-                // WARNING: This is a placeholder. Correct reconstruction requires 
-                // knowing the exact formula `rabitq` uses. 
-                // From estimator.hpp: est_dist = ... f_rescale * (ip ... )
-                // It is hard to reconstruct EXACTLY because it is a projection. 
-                // But for re-ranking, we might just need the distance.
-                
-                memset(out_vec, 0, m_Dim * sizeof(float)); 
-            }
+                float delta = meta_ptr[0];
+                float vl = meta_ptr[1];
 
+                // 使用库函数重建
+                // 注意：这里需要移除 const_cast，因为库函数入参可能没写 const
+                rabitqlib::quant::reconstruct_vec(
+                    const_cast<uint8_t*>(bin_ptr), 
+                    delta, 
+                    vl, 
+                    m_PaddedDim, 
+                    rotated_reconst.data()
+                );
+
+                if (m_Rotator) {
+                     m_Rotator->rotate(rotated_reconst.data(), out_vec_raw);
+                } else {
+                     std::memcpy(out_vec_raw, rotated_reconst.data(), m_Dim * sizeof(float));
+                }
+            }
+            
             virtual SizeType ReconstructSize() const { return m_Dim * sizeof(float); }
             virtual DimensionType ReconstructDim() const { return m_Dim; }
             virtual std::uint64_t BufferSize() const { return sizeof(DimensionType); }
 
-            // IO
             virtual ErrorCode SaveQuantizer(std::shared_ptr<Helper::DiskIO> p_out) const 
             {
                 IOBINARY(p_out, WriteBinary, sizeof(DimensionType), (char*)&m_Dim);
+                int magic = 0x52425451;
+                IOBINARY(p_out, WriteBinary, sizeof(int), (char*)&magic);
                 return ErrorCode::Success;
             }
 
             virtual ErrorCode LoadQuantizer(std::shared_ptr<Helper::DiskIO> p_in) 
             {
-                IOBINARY(p_in, ReadBinary, sizeof(DimensionType), (char*)&m_Dim);
+                DimensionType dim;
+                IOBINARY(p_in, ReadBinary, sizeof(DimensionType), (char*)&dim);
+                m_Dim = dim;
+                int magic;
+                IOBINARY(p_in, ReadBinary, sizeof(int), (char*)&magic);
+                if (m_Rotator) delete m_Rotator;
+                m_Rotator = rabitqlib::choose_rotator<float>(m_Dim);
                 RecalcSizes();
                 return ErrorCode::Success;
             }
 
-            virtual ErrorCode LoadQuantizer(uint8_t* raw_bytes) 
+            virtual ErrorCode LoadQuantizer(std::uint8_t* ptr)
             {
-                m_Dim = *(reinterpret_cast<DimensionType*>(raw_bytes));
+                m_Dim = *(reinterpret_cast<DimensionType*>(ptr));
+                ptr += sizeof(DimensionType);
+                ptr += sizeof(int);
+                if (m_Rotator) delete m_Rotator;
+                m_Rotator = rabitqlib::choose_rotator<float>(m_Dim); 
                 RecalcSizes();
                 return ErrorCode::Success;
             }
 
-            // Distance Calculation - The most critical part
-            // This is "Symmetric" distance (Code vs Code) which RaBitQ doesn't natively optimize for Query scenarios.
-            // RaBitQ is optimized for Asymmetric (Query float vs Code binary).
+            virtual float CosineDistance(const std::uint8_t* pX, const std::uint8_t* pY) const
+            {
+                return L2Distance(pX, pY);
+            }
+
             virtual float L2Distance(const std::uint8_t* pX, const std::uint8_t* pY) const 
             {
-                // This function is rarely used in high-perf search (usu. Asymmetric).
-                // But we must implement it.
-                // Implementing symmetric distance between two OneBit quantized vectors.
+                // 对称距离：先重建，再算距离
+                // 为了性能，实际生产中应该写针对 4-bit 的查表法 Simd
+                // 这里为了正确性，先走完整重建流程
+                std::vector<float> X_rot(m_PaddedDim);
+                std::vector<float> Y_rot(m_PaddedDim);
                 
-                const float* metaX = reinterpret_cast<const float*>(pX);
-                const float* metaY = reinterpret_cast<const float*>(pY);
-                
-                // Decode metadata
-                // ...
-                
-                // Calculate Hamming distance
-                // ...
-                
-                return 0.0f; // TODO: Implement Symmetric L2
+                // 我们只需要重建到 rotated space 即可，不需要 inverse rotate
+                ReconstructRotated(pX, X_rot.data());
+                ReconstructRotated(pY, Y_rot.data());
+
+                return SPTAG::COMMON::DistanceUtils::ComputeL2Distance(X_rot.data(), Y_rot.data(), m_PaddedDim);
             }
-            
-            // Asymmetric Distance: Float Vector vs Encoded Code
-            // This is key! We need to override DistanceCalcSelector logic elsewhere or 
-            // expose a special function. 
-            virtual float CosineDistance(const std::uint8_t* pX, const std::uint8_t* pY) const { return 0.0f; }
+
+            virtual float L2Distance(const void* pX, const std::uint8_t* pY) const
+            {
+                std::vector<float> X_rot(m_PaddedDim);
+                const float* rawX = reinterpret_cast<const float*>(pX);
+
+                if (m_Rotator) {
+                    m_Rotator->rotate(const_cast<float*>(rawX), X_rot.data());
+                } else {
+                    std::memcpy(X_rot.data(), rawX, m_Dim * sizeof(float));
+                    if (m_PaddedDim > m_Dim) std::memset(X_rot.data() + m_Dim, 0, (m_PaddedDim - m_Dim) * sizeof(float));
+                }
+
+                std::vector<float> Y_rot(m_PaddedDim);
+                ReconstructRotated(pY, Y_rot.data());
+
+                return SPTAG::COMMON::DistanceUtils::ComputeL2Distance(X_rot.data(), Y_rot.data(), m_PaddedDim);
+            }
 
         private:
+            inline void ReconstructRotated(const std::uint8_t* qvec, float* out_rot) const 
+            {
+                const float* meta_ptr = reinterpret_cast<const float*>(qvec);
+                const uint8_t* bin_ptr = reinterpret_cast<const uint8_t*>(qvec + m_MetaSize);
+                
+                float delta = meta_ptr[0];
+                float vl = meta_ptr[1];
+                
+                rabitqlib::quant::reconstruct_vec(
+                    const_cast<uint8_t*>(bin_ptr), 
+                    delta, 
+                    vl, 
+                    m_PaddedDim, 
+                    out_rot
+                );
+            }
+
             inline void RecalcSizes()
             {
-                // RaBitQ requires padded bits. Example alignment: 128 for simplicity (adjust if needed).
-                m_PaddedDim = (m_Dim + 127) / 128 * 128;
-                if (m_PaddedDim < m_Dim) m_PaddedDim = m_Dim;
+                if (m_Rotator == nullptr && m_Dim > 0) {
+                     auto* temp = rabitqlib::choose_rotator<float>(m_Dim);
+                     m_PaddedDim = temp->size(); 
+                     delete temp;
+                } else if (m_Rotator) {
+                    m_PaddedDim = m_Rotator->size();
+                } else {
+                    m_PaddedDim = (m_Dim + 127) / 128 * 128;
+                }
 
-                m_CodeSize = m_PaddedDim / 8; // bits -> bytes
-                m_MetaSize = 3 * sizeof(float);
-                m_QuantizedSize = m_CodeSize + m_MetaSize;
+                // 【重要修改】
+                // 如果使用 scalar quantizer，每个维度占用 1 Byte (即使是 4-bit)
+                // 压缩比：32x -> 4x
+                m_CodeSize = m_PaddedDim * 1; 
+                
+                m_MetaSize = 2 * sizeof(float);
+                m_QuantizedSize = m_MetaSize + m_CodeSize;
             }
+
             DimensionType m_Dim;
             DimensionType m_PaddedDim;
             SizeType m_CodeSize;
             SizeType m_MetaSize;
             SizeType m_QuantizedSize;
+            mutable rabitqlib::Rotator<float>* m_Rotator;
+            bool m_EnableADC;
         };
     }
 }
