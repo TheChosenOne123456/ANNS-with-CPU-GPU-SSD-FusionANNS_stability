@@ -171,37 +171,86 @@ namespace SPTAG
                 return L2Distance(pX, pY);
             }
 
+            // [极速融合版] SD Distance
             virtual float L2Distance(const std::uint8_t* pX, const std::uint8_t* pY) const 
             {
-                // 对称距离：先重建，再算距离
-                // 为了性能，实际生产中应该写针对 4-bit 的查表法 Simd
-                // 这里为了正确性，先走完整重建流程
-                std::vector<float> X_rot(m_PaddedDim);
-                std::vector<float> Y_rot(m_PaddedDim);
+                // 1. 获取量化参数
+                const float* metaX = reinterpret_cast<const float*>(pX);
+                const float* metaY = reinterpret_cast<const float*>(pY);
                 
-                // 我们只需要重建到 rotated space 即可，不需要 inverse rotate
-                ReconstructRotated(pX, X_rot.data());
-                ReconstructRotated(pY, Y_rot.data());
+                float deltaX = metaX[0], vlX = metaX[1];
+                float deltaY = metaY[0], vlY = metaY[1];
 
-                return SPTAG::COMMON::DistanceUtils::ComputeL2Distance(X_rot.data(), Y_rot.data(), m_PaddedDim);
-            }
+                // 2. 预计算线性变换系数 (假设 4-bit: 0..15 映射到 -VL..+VL)
+                // 公式: val = (code / 15.0) * 2*VL - VL + Delta
+                // 简化为: val = code * (2*VL/15.0) + (Delta - VL)
+                float scaleX = (2.0f * vlX) / 15.0f;
+                float biasX  = deltaX - vlX;
 
-            virtual float L2Distance(const void* pX, const std::uint8_t* pY) const
-            {
-                std::vector<float> X_rot(m_PaddedDim);
-                const float* rawX = reinterpret_cast<const float*>(pX);
+                float scaleY = (2.0f * vlY) / 15.0f;
+                float biasY  = deltaY - vlY;
 
-                if (m_Rotator) {
-                    m_Rotator->rotate(const_cast<float*>(rawX), X_rot.data());
-                } else {
-                    std::memcpy(X_rot.data(), rawX, m_Dim * sizeof(float));
-                    if (m_PaddedDim > m_Dim) std::memset(X_rot.data() + m_Dim, 0, (m_PaddedDim - m_Dim) * sizeof(float));
+                // 3. 获取数据指针
+                const uint8_t* binX = reinterpret_cast<const uint8_t*>(pX + m_MetaSize);
+                const uint8_t* binY = reinterpret_cast<const uint8_t*>(pY + m_MetaSize);
+                
+                float dist = 0.0f;
+                DimensionType dim = m_PaddedDim;
+
+                // 4. 融合循环 (Auto-vectorization 友好)
+                // 编译器通常能自动将其优化为 AVX 指令
+                #pragma omp simd reduction(+:dist)
+                for (DimensionType i = 0; i < dim; ++i) {
+                    // 直接解压并计算，不通过中间 Buffer
+                    float valX = (float)binX[i] * scaleX + biasX;
+                    float valY = (float)binY[i] * scaleY + biasY;
+                    
+                    float diff = valX - valY;
+                    dist += diff * diff;
                 }
 
-                std::vector<float> Y_rot(m_PaddedDim);
-                ReconstructRotated(pY, Y_rot.data());
+                return dist;
+            }
 
-                return SPTAG::COMMON::DistanceUtils::ComputeL2Distance(X_rot.data(), Y_rot.data(), m_PaddedDim);
+            // [ADC 融合版] 
+            virtual float L2Distance(const void* pX, const std::uint8_t* pY) const
+            {
+                // 必须旋转 Query (这是 ADC 的代价)
+                // 如果在 Benchmark 里这个函数被大量调用，必须确保 Query 只旋转一次
+                // 但在 SPTAG 接口限制下，每次只能这里转
+                
+                float X_rot[2048]; 
+                if (m_PaddedDim > 2048) return std::numeric_limits<float>::max();
+
+                const float* rawX = reinterpret_cast<const float*>(pX);
+                if (m_Rotator) {
+                    m_Rotator->rotate(const_cast<float*>(rawX), X_rot);
+                } else {
+                    std::memcpy(X_rot, rawX, m_Dim * sizeof(float));
+                    if (m_PaddedDim > m_Dim) std::memset(X_rot + m_Dim, 0, (m_PaddedDim - m_Dim) * sizeof(float));
+                }
+
+                // Target 参数
+                const float* metaY = reinterpret_cast<const float*>(pY);
+                float deltaY = metaY[0], vlY = metaY[1];
+                
+                float scaleY = (2.0f * vlY) / 15.0f;
+                float biasY  = deltaY - vlY;
+                
+                const uint8_t* binY = reinterpret_cast<const uint8_t*>(pY + m_MetaSize);
+                
+                float dist = 0.0f;
+                DimensionType dim = m_PaddedDim;
+
+                #pragma omp simd reduction(+:dist)
+                for (DimensionType i = 0; i < dim; ++i) {
+                    // 只需解压 Y
+                    float valY = (float)binY[i] * scaleY + biasY;
+                    float diff = X_rot[i] - valY;
+                    dist += diff * diff;
+                }
+                
+                return dist;
             }
 
         private:

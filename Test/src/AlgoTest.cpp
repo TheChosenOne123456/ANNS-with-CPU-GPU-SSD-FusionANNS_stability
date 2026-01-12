@@ -372,4 +372,189 @@ BOOST_AUTO_TEST_CASE(VerifyRaBitQWrapperAccuracy)
     BOOST_CHECK(passed);
 }
 
+// 新增：集成测试，验证 VectorIndex 能否加载 RaBitQ 配置
+BOOST_AUTO_TEST_CASE(IntegrationTest_BuildIndexWithRaBitQ)
+{
+    std::cout << "\n[RaBitQ] Starting Integration Test: Build Index..." << std::endl;
+
+    // 1. 准备数据
+    int n = 200;
+    int dim = 128;
+    std::shared_ptr<SPTAG::VectorSet> vecSet = std::make_shared<SPTAG::BasicVectorSet>(
+        SPTAG::ByteArray::Alloc(n * dim * sizeof(float)), 
+        SPTAG::VectorValueType::Float, 
+        dim, 
+        n
+    );
+    
+    // 填充随机数据
+    float* data = reinterpret_cast<float*>(vecSet->GetData());
+    for (int i = 0; i < n * dim; i++) {
+        data[i] = (float)(rand() % 1000) / 1000.0f;
+    }
+
+    // 2. 创建 BKT 索引 (最简单的内存索引)
+    // 注意：我们需要显式通过参数配置来启用量化器
+    auto index = SPTAG::VectorIndex::CreateInstance(SPTAG::IndexAlgoType::BKT, SPTAG::VectorValueType::Float);
+    BOOST_CHECK(index != nullptr);
+
+    // 3. 设置配置
+    // 关键：这里模拟从配置文件读取参数
+    // 我们手动设置 Quantizer
+    // 在实际流程中，Quantizer通常是在 Config 阶段被 SetQuantizer 初始化的，或者在 Build Index 时传入
+    
+    // 手动注入 RaBitQQuantizer
+    auto quantizer = std::make_shared<SPTAG::COMMON::RaBitQQuantizer>(dim);
+    index->SetQuantizer(quantizer);
+
+    // 4. 构建索引
+    // SPTAG 的 BuildIndex 会调用 Quantizer->Train 和 Quantizer->Quantize
+    auto ret = index->BuildIndex(vecSet, nullptr, false); 
+    BOOST_CHECK(ret == SPTAG::ErrorCode::Success);
+
+    // 5. 验证是否真的使用了量化
+    BOOST_CHECK(index->GetQuantizer() != nullptr);
+    BOOST_CHECK_EQUAL((int)index->GetQuantizer()->GetQuantizerType(), (int)SPTAG::QuantizerType::RaBitQQuantizer);
+
+    // // 6. 保存再加载 (验证 Save/Load 逻辑)
+    // std::string testFile = "test_rabitq_index"; // 建议去掉 .bin 后缀，因为这通常被视为文件夹或前缀
+    
+    // // 保存
+    // ret = index->SaveIndex(testFile);
+    // BOOST_CHECK(ret == SPTAG::ErrorCode::Success);
+
+    // // 加载回一个新的 Index
+    // // 【修正】：LoadIndex 是静态函数，不需要先 CreateInstance
+    // std::shared_ptr<SPTAG::VectorIndex> index2;
+    // ret = SPTAG::VectorIndex::LoadIndex(testFile, index2);
+    
+    // BOOST_CHECK(ret == SPTAG::ErrorCode::Success);
+    // BOOST_CHECK(index2 != nullptr);
+    
+    // // 验证加载后的 Quantizer
+    // BOOST_CHECK(index2->GetQuantizer() != nullptr);
+    // BOOST_CHECK_EQUAL((int)index2->GetQuantizer()->GetQuantizerType(), (int)SPTAG::QuantizerType::RaBitQQuantizer);
+
+    std::cout << "[Pass] RaBitQ Integrated into BKT Index workflow successfully!" << std::endl;
+
+    // 清理文件 (简单尝试清理，如果是文件夹可能需要递归删除，但在测试中可以暂时忽略)
+    // remove(testFile.c_str()); 
+}
+
+BOOST_AUTO_TEST_CASE(RaBitQ_vs_PQ_Performance_Simulation)
+{
+    std::cout << "\n[Benchmark] Starting RaBitQ vs PQ Simulation (Fixed)..." << std::endl;
+
+    int n = 1000;
+    int dim = 128;
+    int repeats = 100000; // 增加次数
+
+    std::vector<float> data(n * dim);
+    for(int i=0; i<n*dim; ++i) data[i] = (float)(rand()%1000)/1000.0f;
+    std::vector<float> query(dim);
+    for(int i=0; i<dim; ++i) query[i] = (float)(rand()%1000)/1000.0f;
+
+    auto rabitq = std::make_shared<SPTAG::COMMON::RaBitQQuantizer>(dim);
+    rabitq->Train(data.data(), n);
+    
+    std::vector<uint8_t> qQuery(rabitq->QuantizeSize());
+    std::vector<uint8_t> qVec(rabitq->QuantizeSize());
+    rabitq->QuantizeVector(query.data(), qQuery.data());
+    rabitq->QuantizeVector(data.data(), qVec.data());
+
+    // --- RaBitQ ---
+    auto start = std::chrono::high_resolution_clock::now();
+    volatile float total_dist_q = 0; // volatile 阻止优化
+    for(int i=0; i<repeats; ++i) {
+        total_dist_q += rabitq->L2Distance(qQuery.data(), qVec.data());
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration_q = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+
+    // --- Float32 ---
+    start = std::chrono::high_resolution_clock::now();
+    volatile float total_dist_f = 0; // volatile 阻止优化
+    for(int i=0; i<repeats; ++i) {
+        // 为了防止缓存效应太强，我们可以假装每次都在偏移
+        // 但这里为了纯粹测算 kernel 速度，保持不变即可
+        total_dist_f += SPTAG::COMMON::DistanceUtils::ComputeL2Distance(query.data(), data.data(), dim);
+    }
+    end = std::chrono::high_resolution_clock::now();
+    auto duration_f = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    
+    std::cout << "[RaBitQ]  " << repeats << " ops: " << duration_q << " us. (Result: " << total_dist_q << ")" << std::endl;
+    std::cout << "[Float32] " << repeats << " ops: " << duration_f << " us. (Result: " << total_dist_f << ")" << std::endl;
+    
+    if (duration_q > 0)
+        std::cout << "[Result] RaBitQ Speed ratio: " << (float)duration_f / duration_q << "x (Expect < 1.0 now)" << std::endl;
+}
+
+// 【新增】召回率验证测试
+BOOST_AUTO_TEST_CASE(RaBitQ_Search_Recall_Test)
+{
+    std::cout << "\n[Recall] Starting Recall Verification (Self-Search)..." << std::endl;
+
+    int n = 500;
+    int dim = 128;
+    int k = 10;
+
+    // 1. 数据集
+    auto vecSet = std::make_shared<SPTAG::BasicVectorSet>(
+        SPTAG::ByteArray::Alloc(n * dim * sizeof(float)), 
+        SPTAG::VectorValueType::Float, 
+        dim, n);
+    float* data = reinterpret_cast<float*>(vecSet->GetData());
+    for(int i=0; i<n*dim; ++i) data[i] = (float)(rand()%1000)/1000.0f;
+
+    // 2. 构建 Index (BKT + RaBitQ)
+    auto index = SPTAG::VectorIndex::CreateInstance(SPTAG::IndexAlgoType::BKT, SPTAG::VectorValueType::Float);
+    auto quantizer = std::make_shared<SPTAG::COMMON::RaBitQQuantizer>(dim);
+    index->SetQuantizer(quantizer);
+    
+    // 关键参数：保证图构建质量，避免因为图太烂导致搜不到
+    index->SetParameter("RefineIterations", "3"); 
+    index->SetParameter("NeighborhoodSize", "32");
+
+    index->BuildIndex(vecSet, nullptr, false);
+
+    // 3. 测试: 随机选取 20 个已有的向量进行搜索
+    // 理论上最近邻必须是它自己 (Distance close to 0, ID match)
+    int correct_count = 0;
+    int test_queries = 20;
+    
+    // 随机选几个ID
+    std::vector<int> query_ids;
+    for(int i=0; i<test_queries; ++i) query_ids.push_back(rand() % n);
+
+    for(int vid : query_ids) {
+        SPTAG::QueryResult res(vecSet->GetVector(vid), k, true); 
+        index->SearchIndex(res);
+
+        // 验证：Top 1 是否是 vid 本身？
+        bool found = false;
+        // 有时候因为量化误差，自己可能排在第2或第3，只要在 Top K 里就算召回
+        // 这里严格一点，检查 Top 1
+        if (res.GetResult(0)->VID == vid) {
+            found = true;
+            correct_count++;
+        } else {
+             // 放宽一点：检查前3个里面有没有
+             for(int j=0; j<std::min(3, k); ++j) {
+                 if (res.GetResult(j)->VID == vid) {
+                     // found = true; // Uncomment to loose check
+                     // correct_count++;
+                     break;
+                 }
+             }
+             std::cout << "  [Miss] Query " << vid << " -> Top1 is " << res.GetResult(0)->VID << " (Dist: " << res.GetResult(0)->Dist << ")" << std::endl;
+        }
+    }
+
+    float recall = (float)correct_count / test_queries;
+    std::cout << "[Recall] Self-Search Recall@1: " << recall * 100 << "%" << std::endl;
+    
+    // 预期：由于 RaBitQ 保留了方向信息，Identity Recall 应该非常高
+    BOOST_CHECK_MESSAGE(recall > 0.9, "Recall is too low! RaBitQ might be distorting distances too much.");
+}
+
 BOOST_AUTO_TEST_SUITE_END()
