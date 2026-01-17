@@ -173,18 +173,20 @@ namespace SPTAG
                 return L2Distance(pX, pY);
             }
 
-            // [极速融合版] SD Distance
+            // [极速融合版] SD Distance - 使用正确的 RaBitQ 公式
             virtual float L2Distance(const std::uint8_t* pX, const std::uint8_t* pY) const 
             {
-                // 1. 获取量化参数
+                // Unpack Meta
                 const float* metaX = reinterpret_cast<const float*>(pX);
                 const float* metaY = reinterpret_cast<const float*>(pY);
                 
-                // 广播标量参数
-                __m512 vScaleX = _mm512_set1_ps((2.0f * metaX[1]) / 15.0f);
-                __m512 vBiasX  = _mm512_set1_ps(metaX[0] - metaX[1]);
-                __m512 vScaleY = _mm512_set1_ps((2.0f * metaY[1]) / 15.0f);
-                __m512 vBiasY  = _mm512_set1_ps(metaY[0] - metaY[1]);
+                // 公式: val = code * delta + vl
+                // meta[0] = delta, meta[1] = vl
+                __m512 vDeltaX = _mm512_set1_ps(metaX[0]);
+                __m512 vVLX    = _mm512_set1_ps(metaX[1]);
+                
+                __m512 vDeltaY = _mm512_set1_ps(metaY[0]);
+                __m512 vVLY    = _mm512_set1_ps(metaY[1]);
 
                 const uint8_t* binX = reinterpret_cast<const uint8_t*>(pX + m_MetaSize);
                 const uint8_t* binY = reinterpret_cast<const uint8_t*>(pY + m_MetaSize);
@@ -193,42 +195,28 @@ namespace SPTAG
                 DimensionType dim = m_PaddedDim;
                 DimensionType i = 0;
 
-                // 2. AVX-512 主循环 (步进 16)
+                // AVX-512 Loop
                 for (; i + 15 < dim; i += 16) {
-                    // 加载 16 个 uint8 (128-bit)
-                    __m128i rawX = _mm_loadu_si128((const __m128i*)(binX + i));
-                    __m128i rawY = _mm_loadu_si128((const __m128i*)(binY + i));
+                    __m512i intX = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)(binX + i)));
+                    __m512i intY = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)(binY + i)));
 
-                    // 扩展 uint8 -> int32 -> float (512-bit)
-                    // _mm512_cvtepu8_epi32: 零扩展 8-bit 到 32-bit
-                    __m512i intX = _mm512_cvtepu8_epi32(rawX);
-                    __m512i intY = _mm512_cvtepu8_epi32(rawY);
-
-                    // 转换为 float
                     __m512 fX = _mm512_cvtepi32_ps(intX);
                     __m512 fY = _mm512_cvtepi32_ps(intY);
 
-                    // 线性变换: val = code * scale + bias
-                    fX = _mm512_fmadd_ps(fX, vScaleX, vBiasX);
-                    fY = _mm512_fmadd_ps(fY, vScaleY, vBiasY);
+                    // Correct Reconstruction: val = code * delta + vl
+                    fX = _mm512_fmadd_ps(fX, vDeltaX, vVLX);
+                    fY = _mm512_fmadd_ps(fY, vDeltaY, vVLY);
 
-                    // 计算欧氏距离: dist += (x-y)^2
                     __m512 diff = _mm512_sub_ps(fX, fY);
                     vDist = _mm512_fmadd_ps(diff, diff, vDist);
                 }
 
-                // 3. 水平求和
                 float dist = _mm512_reduce_add_ps(vDist);
 
-                // 4. 处理剩余部分
-                float scaleX = (2.0f * metaX[1]) / 15.0f;
-                float biasX  = metaX[0] - metaX[1];
-                float scaleY = (2.0f * metaY[1]) / 15.0f;
-                float biasY  = metaY[0] - metaY[1];
-
+                // Scalar Tail
                 for (; i < dim; ++i) {
-                    float valX = (float)binX[i] * scaleX + biasX;
-                    float valY = (float)binY[i] * scaleY + biasY;
+                    float valX = (float)binX[i] * metaX[0] + metaX[1];
+                    float valY = (float)binY[i] * metaY[0] + metaY[1];
                     float diff = valX - valY;
                     dist += diff * diff;
                 }
@@ -236,19 +224,17 @@ namespace SPTAG
                 return dist;
             }
 
-            // [ADC 融合版 - 回归正确逻辑但优化内存]
+            // [ADC 极速融合版] - 终于可以确信地使用 AVX 在线解码
             virtual float L2Distance(const void* pX, const std::uint8_t* pY) const
             {
-                // 1. 使用 thread_local 缓存 Query (X) 旋转后的结果
-                // 目的：避免 std::vector X_rot(dim) 的 malloc 开销
+                // 1. 旋转 Query - 使用 TLS 缓存避免 malloc
                 static thread_local std::vector<float> tls_X_rot;
                 if (tls_X_rot.size() < m_PaddedDim) tls_X_rot.resize(m_PaddedDim);
                 
-                // 清零 (为了 Rotator 正确性，必须保留)
+                // 必须清零 (Rotator 可能依赖累加)
                 std::memset(tls_X_rot.data(), 0, m_PaddedDim * sizeof(float));
                 float* X_ptr = tls_X_rot.data();
 
-                // 2. 旋转 Query X
                 const float* rawX = reinterpret_cast<const float*>(pX);
                 if (m_Rotator) {
                     m_Rotator->rotate(const_cast<float*>(rawX), X_ptr);
@@ -256,18 +242,44 @@ namespace SPTAG
                     std::memcpy(X_ptr, rawX, m_Dim * sizeof(float));
                 }
 
-                // 3. 【回归点】不手动解压 Y，而是使用 thread_local 缓存 + ReconstructRotated
-                // 既然 ReconstructRotated 的逻辑是绝对正确的，我们就调用它
-                // 只是把输出目标从堆上新建的 vector 改为 TLS 复用的 vector
-                static thread_local std::vector<float> tls_Y_rot;
-                if (tls_Y_rot.size() < m_PaddedDim) tls_Y_rot.resize(m_PaddedDim);
+                // 2. 准备 Target 参数 (Correct Formula)
+                const float* metaY = reinterpret_cast<const float*>(pY);
+                // meta[0] = delta, meta[1] = vl
                 
-                float* Y_ptr = tls_Y_rot.data();
-                ReconstructRotated(pY, Y_ptr); // <--- 调用已知正确的解压函数
+                __m512 vDeltaY = _mm512_set1_ps(metaY[0]);
+                __m512 vVLY    = _mm512_set1_ps(metaY[1]);
+                
+                const uint8_t* binY = reinterpret_cast<const uint8_t*>(pY + m_MetaSize);
+                
+                __m512 vDist = _mm512_setzero_ps();
+                DimensionType dim = m_PaddedDim;
+                DimensionType i = 0;
 
-                // 4. 计算距离 (Float vs Float)
-                // 使用 SPTAG 高度优化的 SIMD 距离函数
-                return SPTAG::COMMON::DistanceUtils::ComputeL2Distance(X_ptr, Y_ptr, m_PaddedDim);
+                // 3. AVX-512 Loop
+                // 不再需要 tls_Y_rot 缓存，直接计算！
+                for (; i + 15 < dim; i += 16) {
+                    __m512 vX = _mm512_loadu_ps(X_ptr + i);
+
+                    __m512i intY = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)(binY + i)));
+                    __m512 fY    = _mm512_cvtepi32_ps(intY);   
+                    
+                    // Correct: val = code * delta + vl
+                    fY = _mm512_fmadd_ps(fY, vDeltaY, vVLY);
+
+                    __m512 diff = _mm512_sub_ps(vX, fY);
+                    vDist = _mm512_fmadd_ps(diff, diff, vDist);
+                }
+                
+                float dist = _mm512_reduce_add_ps(vDist);
+
+                // 4. Scalar Tail
+                for (; i < dim; ++i) {
+                    float valY = (float)binY[i] * metaY[0] + metaY[1];
+                    float diff = X_ptr[i] - valY;
+                    dist += diff * diff;
+                }
+                
+                return dist;
             }
 
         private:

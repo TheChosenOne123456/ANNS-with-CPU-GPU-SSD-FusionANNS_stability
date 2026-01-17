@@ -7,12 +7,14 @@
 #include "inc/Core/Common/CommonUtils.h"
 
 #include "inc/Core/Common/RaBitQQuantizer.h" // 【新增】添加这一行
-// 【新增】为了直接测试 RaBitQ 库的底层逻辑，引入这些头文件
-#include "rabitqlib/quantization/rabitq.hpp"
-#include "rabitqlib/utils/rotator.hpp"
+// // 【新增】为了直接测试 RaBitQ 库的底层逻辑，引入这些头文件
+// #include "rabitqlib/quantization/rabitq.hpp"
+// #include "rabitqlib/utils/rotator.hpp"
 
 #include <unordered_set>
 #include <chrono>
+
+#include <fstream> // 需要增加这个头文件用于计算文件大小
 
 template <typename T>
 void Build(SPTAG::IndexAlgoType algo, std::string distCalcMethod, std::shared_ptr<SPTAG::VectorSet>& vec, std::shared_ptr<SPTAG::MetadataSet>& meta, const std::string out)
@@ -441,9 +443,9 @@ BOOST_AUTO_TEST_CASE(IntegrationTest_BuildIndexWithRaBitQ)
     // remove(testFile.c_str()); 
 }
 
-BOOST_AUTO_TEST_CASE(RaBitQ_vs_PQ_Performance_Simulation)
+BOOST_AUTO_TEST_CASE(RaBitQ_vs_Float32_Kernel_Benchmark)
 {
-    std::cout << "\n[Benchmark] Starting RaBitQ vs PQ Simulation (Fixed)..." << std::endl;
+    std::cout << "\n[Benchmark] Starting RaBitQ vs Float32 (Fixed)..." << std::endl;
 
     int n = 1000;
     int dim = 128;
@@ -492,69 +494,156 @@ BOOST_AUTO_TEST_CASE(RaBitQ_vs_PQ_Performance_Simulation)
 // 【新增】召回率验证测试
 BOOST_AUTO_TEST_CASE(RaBitQ_Search_Recall_Test)
 {
-    std::cout << "\n[Recall] Starting Recall Verification (Self-Search)..." << std::endl;
+    std::cout << "\n=============================================" << std::endl;
+    std::cout << "[Comprehensive Test] RaBitQ: Recall, Latency & Storage" << std::endl;
+    std::cout << "=============================================" << std::endl;
 
-    int n = 500;
-    int dim = 128;
-    int k = 10;
+    int n = 10000;    // Database size
+    int dim = 128;    // Dimension
+    int K = 10;       // Top K
 
-    // 1. 数据集
-    auto vecSet = std::make_shared<SPTAG::BasicVectorSet>(
-        SPTAG::ByteArray::Alloc(n * dim * sizeof(float)), 
-        SPTAG::VectorValueType::Float, 
-        dim, n);
-    float* data = reinterpret_cast<float*>(vecSet->GetData());
+    // 1. Generate Data
+    std::cout << "[1] Generating random data (" << n << " vectors)..." << std::endl;
+    std::vector<float> data(n * dim);
     for(int i=0; i<n*dim; ++i) data[i] = (float)(rand()%1000)/1000.0f;
 
-    // 2. 构建 Index (BKT + RaBitQ)
+    // 2. Build Index (RaBitQ)
+    std::cout << "[2] Building RaBitQ Index..." << std::endl;
     auto index = SPTAG::VectorIndex::CreateInstance(SPTAG::IndexAlgoType::BKT, SPTAG::VectorValueType::Float);
-    auto quantizer = std::make_shared<SPTAG::COMMON::RaBitQQuantizer>(dim);
-    index->SetQuantizer(quantizer);
-    
-    // 关键参数：保证图构建质量，避免因为图太烂导致搜不到
-    index->SetParameter("RefineIterations", "3"); 
+    index->SetParameter("DistCalcMethod", "L2");
+    index->SetParameter("QuantizerType", "RaBitQ"); 
+    index->SetParameter("RefineIterations", "3");
     index->SetParameter("NeighborhoodSize", "32");
+    index->BuildIndex(data.data(), n, dim);
 
-    index->BuildIndex(vecSet, nullptr, false);
-
-    // 3. 测试: 随机选取 20 个已有的向量进行搜索
-    // 理论上最近邻必须是它自己 (Distance close to 0, ID match)
-    int correct_count = 0;
-    int test_queries = 20;
+    // --- 内存/存储 评估 ---
+    std::string temp_index_file = "test_rabitq_perf_index";
+    index->SaveIndex(temp_index_file);
     
-    // 随机选几个ID
-    std::vector<int> query_ids;
-    for(int i=0; i<test_queries; ++i) query_ids.push_back(rand() % n);
+    // 计算文件大小
+    // 【修复】累加所有相关文件的大小
+    std::vector<std::string> index_files = {
+        "vector.bin", 
+        "graph.bin", 
+        "tree.bin",       // BKT/KDT 树结构
+        "quantizer.bin",  // 量化器数据
+        "indexloader.ini",// 配置文件
+        "metadata.bin",
+        "metadataIndex.bin",
+        "deletids.bin"
+    };
 
-    for(int vid : query_ids) {
-        SPTAG::QueryResult res(vecSet->GetVector(vid), k, true); 
-        index->SearchIndex(res);
+    long long index_size_bytes = 0;
+    
+    // 【这里是修复的关键点】定义 raw_data_bytes
+    long long raw_data_bytes = (long long)n * dim * sizeof(float);
+    
+    // 增加路径分隔符逻辑
+    std::string folder_path = temp_index_file;
+    if (folder_path.back() != '/' && folder_path.back() != '\\') folder_path += "/";
 
-        // 验证：Top 1 是否是 vid 本身？
-        bool found = false;
-        // 有时候因为量化误差，自己可能排在第2或第3，只要在 Top K 里就算召回
-        // 这里严格一点，检查 Top 1
-        if (res.GetResult(0)->VID == vid) {
-            found = true;
-            correct_count++;
-        } else {
-             // 放宽一点：检查前3个里面有没有
-             for(int j=0; j<std::min(3, k); ++j) {
-                 if (res.GetResult(j)->VID == vid) {
-                     // found = true; // Uncomment to loose check
-                     // correct_count++;
-                     break;
-                 }
-             }
-             std::cout << "  [Miss] Query " << vid << " -> Top1 is " << res.GetResult(0)->VID << " (Dist: " << res.GetResult(0)->Dist << ")" << std::endl;
+    for(const auto& fname : index_files) {
+        std::ifstream in(folder_path + fname, std::ifstream::ate | std::ifstream::binary);
+        if(in.is_open()) {
+            long long fsize = in.tellg();
+            index_size_bytes += fsize;
+            // 调试打印，确认文件被找到
+            // std::cout << "Found " << fname << ": " << fsize << " bytes" << std::endl;
         }
+        in.close();
     }
 
-    float recall = (float)correct_count / test_queries;
-    std::cout << "[Recall] Self-Search Recall@1: " << recall * 100 << "%" << std::endl;
+    // 3. 性能测试：暴力搜索 (Brute Force / Ground Truth)
+    std::cout << "[3] Running Brute Force Search (Baseline)..." << std::endl;
+    std::vector<std::vector<int>> ground_truths(n, std::vector<int>(K));
     
-    // 预期：由于 RaBitQ 保留了方向信息，Identity Recall 应该非常高
-    BOOST_CHECK_MESSAGE(recall > 0.9, "Recall is too low! RaBitQ might be distorting distances too much.");
+    auto start_bf = std::chrono::high_resolution_clock::now();
+    
+    // 使用 OpenMP 加速暴力搜索的计算，模拟一个强劲的 Baseline
+    #pragma omp parallel for
+    for (int i = 0; i < n; ++i) {
+        std::vector<std::pair<float, int>> distances(n);
+        // 纯计算距离
+        for (int j = 0; j < n; ++j) {
+            float dist = SPTAG::COMMON::DistanceUtils::ComputeL2Distance(
+                data.data() + i*dim, data.data() + j*dim, dim);
+            distances[j] = {dist, j};
+        }
+        // Top K 排序
+        std::sort(distances.begin(), distances.end()); // 全排序 (简单起见)
+        for (int k = 0; k < K; ++k) {
+            ground_truths[i][k] = distances[k].second;
+        }
+    }
+    
+    auto end_bf = std::chrono::high_resolution_clock::now();
+    double time_bf_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_bf - start_bf).count();
+
+    // 4. 性能测试：RaBitQ 索引搜索
+    std::cout << "[4] Running RaBitQ Index Search..." << std::endl;
+    double total_overlap_ratio = 0.0;
+    int perfect_matches = 0;
+
+    auto start_idx = std::chrono::high_resolution_clock::now();
+
+    for (int i = 0; i < n; ++i) {
+        SPTAG::QueryResult res(data.data() + i * dim, K, false);
+        index->SearchIndex(res);
+
+        // (为了不影响计时，召回率统计逻辑也放在循环里，但这点开销相比搜索可以忽略)
+        int intersection_count = 0;
+        // 注意：这里为了速度，我们假设 ground_truths 已经在上面计算好了
+        // 如果 N 很大，频繁建立 unordered_set 会影响计时，但对比暴力搜索依然很快
+        
+        // 简单的验证逻辑
+        for (int k = 0; k < K; ++k) {
+            int found_vid = res.GetResult(k)->VID;
+            // 在 ground truth 中查找
+            bool exist = false;
+            for(int g=0; g<K; ++g) {
+                if(ground_truths[i][g] == found_vid) { exist=true; break; }
+            }
+            if (exist) intersection_count++;
+        }
+        
+        total_overlap_ratio += (double)intersection_count / K;
+        if (intersection_count == K) perfect_matches++;
+    }
+
+    auto end_idx = std::chrono::high_resolution_clock::now();
+    double time_idx_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_idx - start_idx).count();
+
+    // 5. 报告输出
+    double avg_overlap = (total_overlap_ratio / n) * 100.0;
+    double perfect_rate = ((double)perfect_matches / n) * 100.0;
+
+    std::cout << "\n---------------------------------------------" << std::endl;
+    std::cout << "             PERFORMANCE REPORT              " << std::endl;
+    std::cout << "---------------------------------------------" << std::endl;
+    
+    std::cout << "Dataset: N=" << n << ", Dim=" << dim << std::endl;
+    
+    printf("Storage (Raw Float32):   %8.2f MB\n", raw_data_bytes / (1024.0 * 1024.0));
+    printf("Storage (RaBitQ Index):  %8.2f MB\n", index_size_bytes / (1024.0 * 1024.0));
+    printf("Compression Ratio:       %.2fx smaller\n", (float)raw_data_bytes / index_size_bytes);
+    
+    std::cout << "---------------------------------------------" << std::endl;
+
+    printf("Time (Brute Force):      %8.2f ms (%.2f QPS)\n", time_bf_ms, (n * 1000.0) / time_bf_ms);
+    printf("Time (RaBitQ Index):     %8.2f ms (%.2f QPS)\n", time_idx_ms, (n * 1000.0) / time_idx_ms);
+    printf("Speedup:                 %.2fx faster\n", time_bf_ms / time_idx_ms);
+
+    std::cout << "---------------------------------------------" << std::endl;
+
+    std::cout << "[Recall] Average Overlap@" << K << ": " << avg_overlap << "%" << std::endl;
+    std::cout << "[Recall] Perfect Match Rate:   " << perfect_rate << "%" << std::endl;
+    
+    // 简单的 Cleanup
+    for(const auto& fname : index_files) remove((folder_path + fname).c_str());
+
+    BOOST_CHECK_GT(avg_overlap, 90.0); 
+    // 确保有加速效果 (在 N=20000 时，ANN 应该显著快于 O(N^2) 的暴力)
+    BOOST_CHECK_GT(time_bf_ms, time_idx_ms); 
 }
 
 BOOST_AUTO_TEST_SUITE_END()
