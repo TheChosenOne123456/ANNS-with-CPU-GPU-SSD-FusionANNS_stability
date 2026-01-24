@@ -173,7 +173,19 @@ namespace SPTAG
                 return L2Distance(pX, pY);
             }
 
-            // [极速融合版] SD Distance - 使用正确的 RaBitQ 公式
+            // 预处理查询向量（旋转 + 填充）
+            void PreprocessQuery(const float* in_query, float* out_rotated) const
+            {
+                if (m_Rotator) {
+                    m_Rotator->rotate(const_cast<float*>(in_query), out_rotated);
+                } else {
+                    std::memcpy(out_rotated, in_query, m_Dim * sizeof(float)); 
+                    // 处理 Padding (如果需要)
+                    if(m_PaddedDim > m_Dim) std::memset(out_rotated + m_Dim, 0, (m_PaddedDim - m_Dim)*sizeof(float));
+                }
+            }
+
+            // SD Distance - 使用正确的 RaBitQ 公式
             virtual float L2Distance(const std::uint8_t* pX, const std::uint8_t* pY) const 
             {
                 // Unpack Meta
@@ -224,25 +236,10 @@ namespace SPTAG
                 return dist;
             }
 
-            // [ADC 极速融合版] - 终于可以确信地使用 AVX 在线解码
-            virtual float L2Distance(const void* pX, const std::uint8_t* pY) const
+            // ADC 不再旋转Query向量，默认传入的 rotated_query 已经是旋转后的结果（调用PreprocessQuery）
+            virtual float L2Distance(const float* rotated_query, const std::uint8_t* pY) const
             {
-                // 1. 旋转 Query - 使用 TLS 缓存避免 malloc
-                static thread_local std::vector<float> tls_X_rot;
-                if (tls_X_rot.size() < m_PaddedDim) tls_X_rot.resize(m_PaddedDim);
-                
-                // 必须清零 (Rotator 可能依赖累加)
-                std::memset(tls_X_rot.data(), 0, m_PaddedDim * sizeof(float));
-                float* X_ptr = tls_X_rot.data();
-
-                const float* rawX = reinterpret_cast<const float*>(pX);
-                if (m_Rotator) {
-                    m_Rotator->rotate(const_cast<float*>(rawX), X_ptr);
-                } else {
-                    std::memcpy(X_ptr, rawX, m_Dim * sizeof(float));
-                }
-
-                // 2. 准备 Target 参数 (Correct Formula)
+                // 1. 准备 Target 参数 (Correct Formula)
                 const float* metaY = reinterpret_cast<const float*>(pY);
                 // meta[0] = delta, meta[1] = vl
                 
@@ -255,10 +252,10 @@ namespace SPTAG
                 DimensionType dim = m_PaddedDim;
                 DimensionType i = 0;
 
-                // 3. AVX-512 Loop
-                // 不再需要 tls_Y_rot 缓存，直接计算！
+                // 2. AVX-512 Loop
+                // 直接使用传入的 rotated_query，零内存开销，零旋转开销
                 for (; i + 15 < dim; i += 16) {
-                    __m512 vX = _mm512_loadu_ps(X_ptr + i);
+                    __m512 vX = _mm512_loadu_ps(rotated_query + i);
 
                     __m512i intY = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)(binY + i)));
                     __m512 fY    = _mm512_cvtepi32_ps(intY);   
@@ -272,14 +269,27 @@ namespace SPTAG
                 
                 float dist = _mm512_reduce_add_ps(vDist);
 
-                // 4. Scalar Tail
+                // 3. Scalar Tail
                 for (; i < dim; ++i) {
                     float valY = (float)binY[i] * metaY[0] + metaY[1];
-                    float diff = X_ptr[i] - valY;
+                    float diff = rotated_query[i] - valY;
                     dist += diff * diff;
                 }
                 
                 return dist;
+            }
+            
+            // 兼容接口，默认调用前没有旋转Query
+            virtual float L2Distance(const void* pX, const std::uint8_t* pY) const 
+            {
+                // [Fix] Allocate on stack if small, or heap if large. 
+                // Avoiding thread_local for NVCC compatibility.
+                // Assuming max dim isn't huge for stack, but safer to use vector.
+                std::vector<float> temp_rot(m_PaddedDim);
+                
+                PreprocessQuery((const float*)pX, temp_rot.data());
+                
+                return L2Distance(temp_rot.data(), pY); // Call fast version
             }
 
         private:

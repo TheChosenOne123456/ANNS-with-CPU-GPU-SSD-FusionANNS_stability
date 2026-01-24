@@ -477,3 +477,6 @@ SPANN/
 testindices/
 zbtest/
 quan_idx/
+
+# Ignore custom scripts
+quick_command.sh
