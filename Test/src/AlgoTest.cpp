@@ -346,8 +346,10 @@ BOOST_AUTO_TEST_CASE(VerifyRaBitQWrapperAccuracy)
     // B. 对称距离 (Wrapped SD): qA vs qB
     float sdDist = quantizer->L2Distance(qA.data(), qB.data());
 
-    // C. 非对称距离 (Wrapped ADC): vecA vs qB
-    float adcDist = quantizer->L2Distance(vecA.data(), qB.data());
+    // C. 非对称距离 (Wrapped ADC): 必须先对 Query 进行旋转和补齐
+    std::vector<float> rotA(dim + 128); // 多给一点空间容纳可能的 Padding
+    quantizer->PreprocessQuery(vecA.data(), rotA.data());
+    float adcDist = quantizer->L2Distance(rotA.data(), qB.data());
 
     // 5. 打印对比
     std::cout << "[RaBitQ Wrap] Dimension: " << dim << " (Padded inside: " << quantizer->QuantizeSize() - 8 << ")" << std::endl;
@@ -459,16 +461,20 @@ BOOST_AUTO_TEST_CASE(RaBitQ_vs_Float32_Kernel_Benchmark)
     auto rabitq = std::make_shared<SPTAG::COMMON::RaBitQQuantizer>(dim);
     rabitq->Train(data.data(), n);
     
-    std::vector<uint8_t> qQuery(rabitq->QuantizeSize());
+    // std::vector<uint8_t> qQuery(rabitq->QuantizeSize());
     std::vector<uint8_t> qVec(rabitq->QuantizeSize());
-    rabitq->QuantizeVector(query.data(), qQuery.data());
+    // rabitq->QuantizeVector(query.data(), qQuery.data());
     rabitq->QuantizeVector(data.data(), qVec.data());
 
     // --- RaBitQ ---
+    std::vector<float> rotQuery(dim + 128);
+    rabitq->PreprocessQuery(query.data(), rotQuery.data()); // 预处理一遍
+    
     auto start = std::chrono::high_resolution_clock::now();
     volatile float total_dist_q = 0; // volatile 阻止优化
     for(int i=0; i<repeats; ++i) {
-        total_dist_q += rabitq->L2Distance(qQuery.data(), qVec.data());
+        // 修改为 ADC 测速（第一个参数是 float*）
+        total_dist_q += rabitq->L2Distance(rotQuery.data(), qVec.data());
     }
     auto end = std::chrono::high_resolution_clock::now();
     auto duration_q = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();

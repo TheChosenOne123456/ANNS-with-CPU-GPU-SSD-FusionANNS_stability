@@ -5,6 +5,10 @@
 #include "inc/Helper/VectorSetReaders/MemoryReader.h"
 #include "inc/Core/SPANN/ExtraFullGraphSearcher.h"
 #include "inc/SSDServing/process.h"
+
+// [New] ���� RaBitQ ͷ�ļ�
+#include "inc/Core/Common/RaBitQQuantizer.h"
+
 #include "cuda_runtime.h"
 
 #include <chrono>
@@ -433,14 +437,14 @@ namespace SPTAG
             auto cutStartTime = std::chrono::high_resolution_clock::now();
             COMMON::QueryResultSet<T> *queryResults = (COMMON::QueryResultSet<T> *)&p_query;
 
-            // 剪枝策略，根据searchInternalResultNum遍历queryResults, queryResults存放postinglistid和postinglist到query的距离
+            // 剪枝策略，根据searchInternalResultNum遍历queryResults, queryResults存放postinglistid和postinglist到query的距�?
             std::vector<int> postingIDs;
             // std::vector<int> isExistVectorID;
             COMMON::OptHashPosVector deduper;
             deduper.Init(m_options.m_maxCheck, m_options.m_hashExp);
-            float limitDist = queryResults->GetResult(0)->Dist * m_options.m_maxDistRatio; // 设置距离限制（最大距离为最近质心到查询向量距离的8倍）
+            float limitDist = queryResults->GetResult(0)->Dist * m_options.m_maxDistRatio; // 设置距离限制（最大距离为最近质心到查询向量距离�?8倍）
             int ii = 0;
-            for (; ii < m_options.m_searchInternalResultNum; ++ii) // 动态剪枝策略
+            for (; ii < m_options.m_searchInternalResultNum; ++ii) // 动态剪枝策�?
             {
                 auto res = queryResults->GetResult(ii);
                 if (res->VID == -1 || (limitDist > 0.1 && res->Dist > limitDist))
@@ -556,13 +560,13 @@ namespace SPTAG
             auto cutStartTime = std::chrono::high_resolution_clock::now();
             COMMON::QueryResultSet<T> *queryResults = (COMMON::QueryResultSet<T> *)&p_query;
 
-            // 剪枝策略，根据searchInternalResultNum遍历queryResults, queryResults存放postinglistid和postinglist到query的距离
+            // 剪枝策略，根据searchInternalResultNum遍历queryResults, queryResults存放postinglistid和postinglist到query的距�?
             std::vector<int> postingIDs;
             COMMON::OptHashPosVector deduper;
             deduper.Init(m_options.m_maxCheck, m_options.m_hashExp);
-            float limitDist = queryResults->GetResult(0)->Dist * m_options.m_maxDistRatio; // 设置距离限制（最大距离为最近质心到查询向量距离的8倍）
+            float limitDist = queryResults->GetResult(0)->Dist * m_options.m_maxDistRatio; // 设置距离限制（最大距离为最近质心到查询向量距离�?8倍）
             int ii = 0;
-            for (; ii < m_options.m_searchInternalResultNum; ++ii) // 动态剪枝策略
+            for (; ii < m_options.m_searchInternalResultNum; ++ii) // 动态剪枝策�?
             {
                 auto res = queryResults->GetResult(ii);
                 if (res->VID == -1 || (limitDist > 0.1 && res->Dist > limitDist))
@@ -652,11 +656,11 @@ namespace SPTAG
             COMMON::OptHashPosVector deduper;
             deduper.Init(m_options.m_maxCheck, m_options.m_hashExp);
 
-            // 剪枝策略，根据searchInternalResultNum遍历queryResults, queryResults存放postinglistid和postinglist到query的距离
+            // 剪枝策略，根据searchInternalResultNum遍历queryResults, queryResults存放postinglistid和postinglist到query的距�?
             std::vector<SizeType> postingIDs;
-            float limitDist = queryResults->GetResult(0)->Dist * m_options.m_maxDistRatio; // 设置距离限制（最大距离为最近质心到查询向量距离的8倍）
+            float limitDist = queryResults->GetResult(0)->Dist * m_options.m_maxDistRatio; // 设置距离限制（最大距离为最近质心到查询向量距离�?8倍）
             int ii = 0;
-            for (; ii < m_options.m_searchInternalResultNum; ++ii) // 动态剪枝策略
+            for (; ii < m_options.m_searchInternalResultNum; ++ii) // 动态剪枝策�?
             {
                 auto res = queryResults->GetResult(ii);
                 if (res->VID == -1 || (limitDist > 0.1 && res->Dist > limitDist))
@@ -755,13 +759,45 @@ namespace SPTAG
         }
 
         /*
-            tyh: 批量异步读方案
+            tyh: 批量异步读方�?
         */
         template <typename T>
         ErrorCode Index<T>::RerankFullVector(QueryResult &p_query, std::shared_ptr<VectorSet> vectorSet, int threadOrder, std::unordered_set<int>& postingIDSet, SearchStats* p_stats) const
         {
             COMMON::QueryResultSet<T> *queryResults = (COMMON::QueryResultSet<T> *)&p_query;
             const T* targetVector = reinterpret_cast<const T *>(queryResults->GetTarget());
+
+            // [RaBitQ Optimization] Pre-rotate query if using RaBitQ
+            // ����һ���ǳ��ؼ����Ż����������ڻص����ظ���ת
+            std::vector<float> rotatedQuery;
+            bool useRaBitQ = false;
+            const COMMON::RaBitQQuantizer* rabitq_ptr = nullptr;
+
+            if (m_pQuantizer && m_pQuantizer->GetQuantizerType() == QuantizerType::RaBitQQuantizer)
+            {
+                useRaBitQ = true;
+                rabitq_ptr = static_cast<const COMMON::RaBitQQuantizer*>(m_pQuantizer.get());
+                // Rotate once per query!
+                // Assumes T is compatible with float (or add conversion)
+                if constexpr (std::is_same<T, float>::value || std::is_same<T, uint8_t>::value) {
+                    // Need to convert T to float for PreprocessQuery if T is uint8
+                    // But usually targetVector is already the query type needed.
+                    // Let's assume input is convertable.
+                    
+                    // Allocate buffer for rotated query
+                    rotatedQuery.resize(m_options.m_dim + 16); // +padding just in case
+                    
+                    // Convert and Rotate
+                    if constexpr (std::is_same<T, uint8_t>::value) {
+                         std::vector<float> tempQ(m_options.m_dim);
+                         for(int i=0; i<m_options.m_dim; ++i) tempQ[i] = (float)targetVector[i];
+                         rabitq_ptr->PreprocessQuery(tempQ.data(), rotatedQuery.data());
+                    } else {
+                         rabitq_ptr->PreprocessQuery((const float*)targetVector, rotatedQuery.data());
+                    }
+                }
+            }
+
             std::vector<Helper::AsyncReadRequest> diskRequests;
             // std::vector<char*> buffers;
 
@@ -793,13 +829,39 @@ namespace SPTAG
                     request.m_status = threadOrder;
                     request.m_success = false;
 
-                    request.m_callback = [queryResults, j, buffer_ptr, alignedOffset, targetVector, pageCountref, readSize, this](bool success)
+                    // [RaBitQ] Capture necessary variables for the lambda
+                    // Note: capturing vector by value might be expensive, but shared_ptr/pointer is better.
+                    // Here we pass rotatedQuery data pointer if useRaBitQ is true.
+                    const float* rot_q_ptr = useRaBitQ ? rotatedQuery.data() : nullptr;
+
+                    // �޸ĺ������� useRaBitQ, rabitq_ptr, rot_q_ptr
+                    request.m_callback = [queryResults, j, buffer_ptr, alignedOffset, targetVector, pageCountref, readSize, this, useRaBitQ, rabitq_ptr, rot_q_ptr](bool success)
                     {
                         *pageCountref += readSize;
                         SPTAG::BasicResult* result = queryResults->GetResult(j);
-                        const size_t dataOffset = static_cast<size_t>(result->VID) * m_options.m_dim * sizeof(T) + 2 * sizeof(int) - alignedOffset;
-                        const T* queryVector = reinterpret_cast<const T*>(buffer_ptr + dataOffset);
-                        result->Dist = COMMON::DistanceUtils::ComputeDistance(targetVector, queryVector, m_options.m_dim, m_options.m_distCalcMethod);
+                        using QuantizerType = SPTAG::QuantizerType;
+                        
+                        // Fix for dynamic vector size (PQ/RaBitQ compressed size vs Raw Dim)
+                        size_t vecSize = m_options.m_dim * sizeof(T);
+                        if (this->m_pQuantizer) {
+                             vecSize = this->m_pQuantizer->GetNumSubvectors();
+                        }
+
+                        const size_t dataOffset = static_cast<size_t>(result->VID) * vecSize + 2 * sizeof(int) - alignedOffset;
+
+                        if (useRaBitQ && rabitq_ptr)
+                        {
+                            // [RaBitQ Path]
+                            const uint8_t* compressed_vec = reinterpret_cast<const uint8_t*>(buffer_ptr + dataOffset);
+                            // Call the fast L2Distance which takes rotated query
+                            result->Dist = rabitq_ptr->L2Distance(rot_q_ptr, compressed_vec);
+                        }
+                        else 
+                        {
+                            // [Original/PQ Path]
+                            const T* queryVector = reinterpret_cast<const T*>(buffer_ptr + dataOffset);
+                            result->Dist = COMMON::DistanceUtils::ComputeDistance(targetVector, queryVector, m_options.m_dim, m_options.m_distCalcMethod);
+                        }
                     };
                     diskRequests.push_back(std::move(request));  // Store the request
                 }
@@ -840,7 +902,7 @@ namespace SPTAG
                 {
                     int totalDone = 0, totalSubmitted = 0, totalQueued = 0;
                     int batchStartIdx = done;
-                    int batchEndIdx = std::min(done + batchSize, totalToSubmit); // 计算当前批次的结束位置
+                    int batchEndIdx = std::min(done + batchSize, totalToSubmit); // 计算当前批次的结束位�?
                     int totalBatchSize = batchEndIdx - batchStartIdx;
                     while (totalDone < totalBatchSize) {
                         if (totalSubmitted < totalBatchSize) {
@@ -1050,7 +1112,7 @@ namespace SPTAG
                 {
                     int totalDone = 0, totalSubmitted = 0, totalQueued = 0;
                     int batchStartIdx = done;
-                    int batchEndIdx = std::min(done + batchSize, totalToSubmit); // 计算当前批次的结束位置
+                    int batchEndIdx = std::min(done + batchSize, totalToSubmit); // 计算当前批次的结束位�?
                     int totalBatchSize = batchEndIdx - batchStartIdx;
                     while (totalDone < totalBatchSize) {
                         if (totalSubmitted < totalBatchSize) {
