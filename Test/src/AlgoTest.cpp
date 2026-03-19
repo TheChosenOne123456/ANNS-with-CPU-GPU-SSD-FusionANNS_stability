@@ -420,29 +420,29 @@ BOOST_AUTO_TEST_CASE(IntegrationTest_BuildIndexWithRaBitQ)
     BOOST_CHECK(index->GetQuantizer() != nullptr);
     BOOST_CHECK_EQUAL((int)index->GetQuantizer()->GetQuantizerType(), (int)SPTAG::QuantizerType::RaBitQQuantizer);
 
-    // // 6. 保存再加载 (验证 Save/Load 逻辑)
-    // std::string testFile = "test_rabitq_index"; // 建议去掉 .bin 后缀，因为这通常被视为文件夹或前缀
+    // 6. 保存再加载 (验证 Save/Load 逻辑)
+    std::string testFile = "test_rabitq_index"; // 建议去掉 .bin 后缀，因为这通常被视为文件夹或前缀
     
-    // // 保存
-    // ret = index->SaveIndex(testFile);
-    // BOOST_CHECK(ret == SPTAG::ErrorCode::Success);
+    // 保存
+    ret = index->SaveIndex(testFile);
+    BOOST_CHECK(ret == SPTAG::ErrorCode::Success);
 
-    // // 加载回一个新的 Index
-    // // 【修正】：LoadIndex 是静态函数，不需要先 CreateInstance
-    // std::shared_ptr<SPTAG::VectorIndex> index2;
-    // ret = SPTAG::VectorIndex::LoadIndex(testFile, index2);
+    // 加载回一个新的 Index
+    // 【修正】：LoadIndex 是静态函数，不需要先 CreateInstance
+    std::shared_ptr<SPTAG::VectorIndex> index2;
+    ret = SPTAG::VectorIndex::LoadIndex(testFile, index2);
     
-    // BOOST_CHECK(ret == SPTAG::ErrorCode::Success);
-    // BOOST_CHECK(index2 != nullptr);
+    BOOST_CHECK(ret == SPTAG::ErrorCode::Success);
+    BOOST_CHECK(index2 != nullptr);
     
-    // // 验证加载后的 Quantizer
-    // BOOST_CHECK(index2->GetQuantizer() != nullptr);
-    // BOOST_CHECK_EQUAL((int)index2->GetQuantizer()->GetQuantizerType(), (int)SPTAG::QuantizerType::RaBitQQuantizer);
+    // 验证加载后的 Quantizer
+    BOOST_CHECK(index2->GetQuantizer() != nullptr);
+    BOOST_CHECK_EQUAL((int)index2->GetQuantizer()->GetQuantizerType(), (int)SPTAG::QuantizerType::RaBitQQuantizer);
 
     std::cout << "[Pass] RaBitQ Integrated into BKT Index workflow successfully!" << std::endl;
 
     // 清理文件 (简单尝试清理，如果是文件夹可能需要递归删除，但在测试中可以暂时忽略)
-    // remove(testFile.c_str()); 
+    remove(testFile.c_str()); 
 }
 
 BOOST_AUTO_TEST_CASE(RaBitQ_vs_Float32_Kernel_Benchmark)
@@ -504,7 +504,7 @@ BOOST_AUTO_TEST_CASE(RaBitQ_Search_Recall_Test)
     std::cout << "[Comprehensive Test] RaBitQ: Recall, Latency & Storage" << std::endl;
     std::cout << "=============================================" << std::endl;
 
-    int n = 10000;    // Database size
+    int n = 20000;    // Database size
     int dim = 128;    // Dimension
     int K = 10;       // Top K
 
@@ -517,7 +517,9 @@ BOOST_AUTO_TEST_CASE(RaBitQ_Search_Recall_Test)
     std::cout << "[2] Building RaBitQ Index..." << std::endl;
     auto index = SPTAG::VectorIndex::CreateInstance(SPTAG::IndexAlgoType::BKT, SPTAG::VectorValueType::Float);
     index->SetParameter("DistCalcMethod", "L2");
-    index->SetParameter("QuantizerType", "RaBitQ"); 
+    // index->SetParameter("QuantizerType", "RaBitQ"); 
+    auto quantizer = std::make_shared<SPTAG::COMMON::RaBitQQuantizer>(dim);
+    index->SetQuantizer(quantizer);
     index->SetParameter("RefineIterations", "3");
     index->SetParameter("NeighborhoodSize", "32");
     index->BuildIndex(data.data(), n, dim);

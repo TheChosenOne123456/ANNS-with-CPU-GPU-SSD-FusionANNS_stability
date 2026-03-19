@@ -134,10 +134,20 @@ namespace SPTAG
             
             virtual SizeType ReconstructSize() const { return m_Dim * sizeof(float); }
             virtual DimensionType ReconstructDim() const { return m_Dim; }
-            virtual std::uint64_t BufferSize() const { return sizeof(DimensionType); }
+            virtual std::uint64_t BufferSize() const { 
+                // 返回完整的空间大小：量化器类型 + 还原向量类型 + 维度 + MagicNumber
+                return sizeof(QuantizerType) + sizeof(VectorValueType) + sizeof(DimensionType) + sizeof(int); 
+            }
 
             virtual ErrorCode SaveQuantizer(std::shared_ptr<Helper::DiskIO> p_out) const 
             {
+                // 【核心修复】：必须先写入类型头票据，才能被通用 LoadIQuantizer 解码映射！
+                QuantizerType qtype = QuantizerType::RaBitQQuantizer;
+                VectorValueType rtype = VectorValueType::Float;
+                IOBINARY(p_out, WriteBinary, sizeof(QuantizerType), (char*)&qtype);
+                IOBINARY(p_out, WriteBinary, sizeof(VectorValueType), (char*)&rtype);
+
+                // 核心业务参数
                 IOBINARY(p_out, WriteBinary, sizeof(DimensionType), (char*)&m_Dim);
                 int magic = 0x52425451;
                 IOBINARY(p_out, WriteBinary, sizeof(int), (char*)&magic);
