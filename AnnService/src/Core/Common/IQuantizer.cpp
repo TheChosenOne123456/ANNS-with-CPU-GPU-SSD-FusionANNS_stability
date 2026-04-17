@@ -37,8 +37,19 @@ namespace SPTAG
                 if (ret->LoadQuantizer(p_in) != ErrorCode::Success) ret.reset();
                 return ret;
             case QuantizerType::RaBitQQuantizer:
-                // RaBitQQuantizer is not templated by reconstruct type; it reconstructs float by design.
-                ret.reset(new RaBitQQuantizer());
+                switch (reconstructType) {
+                case VectorValueType::Float:
+                    ret.reset(new RaBitQQuantizer<float>());
+                    break;
+                case VectorValueType::UInt8:
+                    ret.reset(new RaBitQQuantizer<std::uint8_t>());
+                    break;
+                default:
+                    // 为兼容老文件，默认按 float
+                    ret.reset(new RaBitQQuantizer<float>());
+                    break;
+                }
+
                 if (ret->LoadQuantizer(p_in) != ErrorCode::Success) ret.reset();
                 return ret;
             case QuantizerType::OPQQuantizer:
@@ -89,7 +100,18 @@ namespace SPTAG
                 if (ret->LoadQuantizer(raw_bytes) != ErrorCode::Success) ret.reset();
                 return ret;
             case QuantizerType::RaBitQQuantizer:
-                ret.reset(new RaBitQQuantizer());
+                switch (reconstructType) {
+                case VectorValueType::Float:
+                    ret.reset(new RaBitQQuantizer<float>());
+                    break;
+                case VectorValueType::UInt8:
+                    ret.reset(new RaBitQQuantizer<std::uint8_t>());
+                    break;
+                default:
+                    ret.reset(new RaBitQQuantizer<float>());
+                    break;
+                }
+
                 if (ret->LoadQuantizer(raw_bytes) != ErrorCode::Success) ret.reset();
                 return ret;
             case QuantizerType::OPQQuantizer:

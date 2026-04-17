@@ -771,30 +771,50 @@ namespace SPTAG
             // 这是一个非常关键的优化，避免了在回调中重复旋转
             std::vector<float> rotatedQuery;
             bool useRaBitQ = false;
-            const COMMON::RaBitQQuantizer* rabitq_ptr = nullptr;
+            const COMMON::RaBitQQuantizer<float>* rabitq_ptr_f = nullptr;
+            const COMMON::RaBitQQuantizer<std::uint8_t>* rabitq_ptr_u8 = nullptr;
 
             if (m_pQuantizer && m_pQuantizer->GetQuantizerType() == QuantizerType::RaBitQQuantizer)
             {
-                useRaBitQ = true;
-                rabitq_ptr = static_cast<const COMMON::RaBitQQuantizer*>(m_pQuantizer.get());
-                // Rotate once per query!
-                // Assumes T is compatible with float (or add conversion)
-                if constexpr (std::is_same<T, float>::value || std::is_same<T, uint8_t>::value) {
-                    // Need to convert T to float for PreprocessQuery if T is uint8
-                    // But usually targetVector is already the query type needed.
-                    // Let's assume input is convertable.
-                    
-                    // Allocate buffer for rotated query
-                    rotatedQuery.resize(m_options.m_dim + 16); // +padding just in case
-                    
-                    // Convert and Rotate
-                    if constexpr (std::is_same<T, uint8_t>::value) {
-                         std::vector<float> tempQ(m_options.m_dim);
-                         for(int i=0; i<m_options.m_dim; ++i) tempQ[i] = (float)targetVector[i];
-                         rabitq_ptr->PreprocessQuery(tempQ.data(), rotatedQuery.data());
-                    } else {
-                         rabitq_ptr->PreprocessQuery((const float*)targetVector, rotatedQuery.data());
+                if (m_pQuantizer->GetReconstructType() == VectorValueType::Float) {
+                    rabitq_ptr_f = static_cast<const COMMON::RaBitQQuantizer<float>*>(m_pQuantizer.get());
+                } else if (m_pQuantizer->GetReconstructType() == VectorValueType::UInt8) {
+                    rabitq_ptr_u8 = static_cast<const COMMON::RaBitQQuantizer<std::uint8_t>*>(m_pQuantizer.get());
+                }
+
+                useRaBitQ = (rabitq_ptr_f != nullptr || rabitq_ptr_u8 != nullptr);
+
+                if constexpr (std::is_same<T, float>::value || std::is_same<T, std::uint8_t>::value) {
+                    if (useRaBitQ) {
+                        rotatedQuery.resize(m_options.m_dim + 16, 0.0f);
+
+                        if constexpr (std::is_same<T, float>::value) {
+                            if (rabitq_ptr_f) {
+                                rabitq_ptr_f->PreprocessQuery(targetVector, rotatedQuery.data());
+                            } else {
+                                std::vector<std::uint8_t> tempQ(m_options.m_dim);
+                                for (int i = 0; i < m_options.m_dim; ++i) {
+                                    float v = targetVector[i];
+                                    if (v < 0.0f) v = 0.0f;
+                                    if (v > 255.0f) v = 255.0f;
+                                    tempQ[i] = static_cast<std::uint8_t>(v + 0.5f);
+                                }
+                                rabitq_ptr_u8->PreprocessQuery(tempQ.data(), rotatedQuery.data());
+                            }
+                        } else { // T == uint8_t
+                            if (rabitq_ptr_u8) {
+                                rabitq_ptr_u8->PreprocessQuery(targetVector, rotatedQuery.data());
+                            } else {
+                                std::vector<float> tempQ(m_options.m_dim);
+                                for (int i = 0; i < m_options.m_dim; ++i) {
+                                    tempQ[i] = static_cast<float>(targetVector[i]);
+                                }
+                                rabitq_ptr_f->PreprocessQuery(tempQ.data(), rotatedQuery.data());
+                            }
+                        }
                     }
+                } else {
+                    useRaBitQ = false;
                 }
             }
 
@@ -835,28 +855,29 @@ namespace SPTAG
                     const float* rot_q_ptr = useRaBitQ ? rotatedQuery.data() : nullptr;
 
                     // 修改后：添加了 useRaBitQ, rabitq_ptr, rot_q_ptr
-                    request.m_callback = [queryResults, j, buffer_ptr, alignedOffset, targetVector, pageCountref, readSize, this, useRaBitQ, rabitq_ptr, rot_q_ptr](bool success)
+                    request.m_callback = [queryResults, j, buffer_ptr, alignedOffset, targetVector, pageCountref, readSize, this, useRaBitQ, rabitq_ptr_f, rabitq_ptr_u8, rot_q_ptr](bool success)
                     {
                         *pageCountref += readSize;
                         SPTAG::BasicResult* result = queryResults->GetResult(j);
                         using QuantizerType = SPTAG::QuantizerType;
-                        
-                        // Fix for dynamic vector size (PQ/RaBitQ compressed size vs Raw Dim)
+
                         size_t vecSize = m_options.m_dim * sizeof(T);
                         if (this->m_pQuantizer) {
-                             vecSize = this->m_pQuantizer->GetNumSubvectors();
+                            vecSize = this->m_pQuantizer->QuantizeSize();
                         }
 
                         const size_t dataOffset = static_cast<size_t>(result->VID) * vecSize + 2 * sizeof(int) - alignedOffset;
 
-                        if (useRaBitQ && rabitq_ptr)
+                        if (useRaBitQ && (rabitq_ptr_f != nullptr || rabitq_ptr_u8 != nullptr))
                         {
-                            // [RaBitQ Path]
                             const uint8_t* compressed_vec = reinterpret_cast<const uint8_t*>(buffer_ptr + dataOffset);
-                            // Call the fast L2Distance which takes rotated query
-                            result->Dist = rabitq_ptr->L2Distance(rot_q_ptr, compressed_vec);
+                            if (rabitq_ptr_f) {
+                                result->Dist = rabitq_ptr_f->L2Distance(rot_q_ptr, compressed_vec);
+                            } else {
+                                result->Dist = rabitq_ptr_u8->L2Distance(rot_q_ptr, compressed_vec);
+                            }
                         }
-                        else 
+                        else
                         {
                             // [Original/PQ Path]
                             const T* queryVector = reinterpret_cast<const T*>(buffer_ptr + dataOffset);
