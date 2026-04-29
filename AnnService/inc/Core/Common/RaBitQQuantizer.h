@@ -51,7 +51,7 @@ namespace SPTAG
                 : m_Dim(0),
                   m_PaddedDim(0),
                   m_CodeSize(0),
-                  m_MetaSize(2 * sizeof(float)),
+                  m_MetaSize(sizeof(RaBitQEstimateMeta)),
                   m_QuantizedSize(0),
                   m_Rotator(nullptr),
                   m_EnableADC(false),
@@ -108,8 +108,8 @@ namespace SPTAG
 
             void SetBitsPerCode(SizeType bits)
             {
-                // 当前这版距离核按“每维1字节”读取，建议先限制在 4/8
-                if (bits != 4 && bits != 8) bits = 4;
+                // 当前这版距离核按“每维1字节”读取，建议先限制在 1/2/4/8
+                if (bits != 1 && bits != 2 && bits != 4 && bits != 8) bits = 4;
                 m_BitsPerCode = bits;
                 RecalcSizes();
             }
@@ -118,6 +118,123 @@ namespace SPTAG
             
             // 设置旋转器存储类型（影响 Save/Load 行为）
             void SetRotatorType(RotatorStorageType t) { m_RotatorType = t; }
+
+            // 数据向量的元信息
+            struct RaBitQEstimateMeta {
+                float delta;
+                float vl;
+                float f_add;
+                float f_rescale;
+                float f_error;
+            };
+
+            // 查询向量的元信息，和理论误差界限的计算相关
+            struct BondMeta {
+                float g_add;
+                float k1xsumq;
+                float g_error;
+            };
+
+            // 构建查询侧估算因子（对应论文公式里的 g_add / k1xsumq / g_error）
+            inline void BuildL2EstimateQueryFactors(
+                const float* rotated_query,
+                BondMeta& bond_meta
+            ) const
+            {
+                float sumq = 0.0f;
+                float norm2 = 0.0f;
+                for (DimensionType i = 0; i < m_PaddedDim; ++i)  {
+                    float v = rotated_query[i];
+                    sumq += v;
+                    norm2 += v * v;
+                }
+
+                // L2 下 g_add = ||q||^2
+                bond_meta.g_add = norm2;
+
+                // 与 rabitqlib::query.hpp 的 c1 一致: c1 = -((1<<1)-1)/2 = -0.5
+                bond_meta.k1xsumq = -0.5f * sumq;
+
+                // 误差界项里会乘 g_error（L2 下为 ||q||）
+                bond_meta.g_error = std::sqrt(std::max(0.0f, norm2));
+            }
+
+            // full_est_dist 需要的内积函数指针（float query vs uint8 code）
+            inline static float IPFloatU8(const float* q, const uint8_t* c, size_t dim)
+            {
+                return rabitqlib::excode_ipimpl::ip_fxi<float, uint8_t>(q, c, dim);
+            }
+
+            // 新的估算距离核心：返回估算距离；可选返回 lower bound
+            inline float L2DistanceEstimate(
+                const float* rotated_query,
+                const std::uint8_t* pY,
+                float* out_low_dist = nullptr
+            ) const
+            {
+                const auto* meta = reinterpret_cast<const RaBitQEstimateMeta*>(pY);
+                const uint8_t* code = reinterpret_cast<const uint8_t*>(pY + m_MetaSize);
+
+                // float g_add = 0.0f;
+                // float k1xsumq = 0.0f;
+                // float g_error = 0.0f;
+                BondMeta bond_meta;
+                BuildL2EstimateQueryFactors(rotated_query, bond_meta);
+
+                float est = rabitqlib::quant::full_est_dist<float, uint8_t>(
+                    code,
+                    rotated_query,
+                    &RaBitQQuantizer<T>::IPFloatU8,
+                    m_PaddedDim,
+                    m_BitsPerCode,
+                    meta->f_add,
+                    meta->f_rescale,
+                    bond_meta.g_add,
+                    bond_meta.k1xsumq
+                );
+
+                // 论文式 lower bound（保守剪枝）
+                if (out_low_dist != nullptr) {
+                    *out_low_dist = est - meta->f_error * bond_meta.g_error;
+                }
+
+                return est;
+            }
+
+            // 重载，额外接收查询元信息以避免重复计算
+            inline float L2DistanceEstimate(
+                const float* rotated_query,
+                const std::uint8_t* pY,
+                const BondMeta bond_meta,
+                float* out_low_dist = nullptr
+            ) const
+            {
+                const auto* meta = reinterpret_cast<const RaBitQEstimateMeta*>(pY);
+                const uint8_t* code = reinterpret_cast<const uint8_t*>(pY + m_MetaSize);
+
+                float g_add = bond_meta.g_add;
+                float k1xsumq = bond_meta.k1xsumq;
+                float g_error = bond_meta.g_error;
+
+                float est = rabitqlib::quant::full_est_dist<float, uint8_t>(
+                    code,
+                    rotated_query,
+                    &RaBitQQuantizer<T>::IPFloatU8,
+                    m_PaddedDim,
+                    m_BitsPerCode,
+                    meta->f_add,
+                    meta->f_rescale,
+                    g_add,
+                    k1xsumq
+                );
+
+                // 论文式 lower bound（保守剪枝）
+                if (out_low_dist != nullptr) {
+                    *out_low_dist = est - meta->f_error * g_error;
+                }
+
+                return est;
+            }
 
             // 训练阶段仅用于选择旋转器和更新尺寸
             void Train(const void* data, SizeType num)
@@ -152,12 +269,12 @@ namespace SPTAG
                     std::memcpy(rotated_vec.data(), fvec.data(), m_Dim * sizeof(float));
                 }
 
-                float* meta_ptr = reinterpret_cast<float*>(vecout);
+                auto* meta = reinterpret_cast<RaBitQEstimateMeta*>(vecout);
                 uint8_t* bin_ptr = reinterpret_cast<uint8_t*>(vecout + m_MetaSize);
 
-                float delta = 0;
-                float vl = 0;
-
+                // 1) 保留原来的 scalar 量化（用于重构与旧路径兼容）
+                float delta = 0.0f;
+                float vl = 0.0f;
                 rabitqlib::quant::quantize_scalar(
                     rotated_vec.data(),
                     m_PaddedDim,
@@ -167,8 +284,35 @@ namespace SPTAG
                     vl
                 );
 
-                meta_ptr[0] = delta;
-                meta_ptr[1] = vl;
+                // 2) 额外计算论文估算需要的 f_add/f_rescale/f_error
+                float f_add = 0.0f;
+                float f_rescale = 0.0f;
+                float f_error = 0.0f;
+                std::vector<uint8_t> check_code(m_PaddedDim, 0);
+
+                rabitqlib::quant::quantize_full_single<float, uint8_t>(
+                    rotated_vec.data(),
+                    m_PaddedDim,
+                    m_BitsPerCode,
+                    check_code.data(),
+                    f_add,
+                    f_rescale,
+                    f_error,
+                    rabitqlib::METRIC_L2
+                );
+
+            #ifndef NDEBUG
+                // 两条路径理论上应产生一致码字；调试期做一致性检查
+                if (std::memcmp(check_code.data(), bin_ptr, m_CodeSize) != 0) {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Warning, "RaBitQ scalar/full code mismatch detected.\n");
+                }
+            #endif
+
+                meta->delta = delta;
+                meta->vl = vl;
+                meta->f_add = f_add;
+                meta->f_rescale = f_rescale;
+                meta->f_error = f_error;
             }
 
             // 将量化向量反量化重建为原始 float 向量
@@ -373,7 +517,10 @@ namespace SPTAG
             }
 
             // 计算两个量化向量之间的对称 L2 距离（SD）
-            virtual float L2Distance(const std::uint8_t* pX, const std::uint8_t* pY) const
+            inline float L2DistanceByDequantization(
+                const std::uint8_t* pX,
+                const std::uint8_t* pY
+            ) const
             {
                 const float* metaX = reinterpret_cast<const float*>(pX);
                 const float* metaY = reinterpret_cast<const float*>(pY);
@@ -420,7 +567,10 @@ namespace SPTAG
             }
 
             // ADC 不再旋转Query向量，默认传入的 rotated_query 已经是旋转后的结果（调用PreprocessQuery）
-            virtual float L2Distance(const float* rotated_query, const std::uint8_t* pY) const
+            inline float L2DistanceByDequantization(
+                const float* rotated_query,
+                const std::uint8_t* pY
+            ) const
             {
                 const float* metaY = reinterpret_cast<const float*>(pY);
                 __m512 vDeltaY = _mm512_set1_ps(metaY[0]);
@@ -451,7 +601,25 @@ namespace SPTAG
                 return dist;
             }
 
-            // 兼容入口并根据输入模式自动做查询预处理后计算 ADC 距离
+            // IQuantizer 强制的对称接口：暂时保持旧语义（论文估算主要用于 query->db）
+            virtual float L2Distance(const std::uint8_t* pX, const std::uint8_t* pY) const
+            {
+                return L2DistanceByDequantization(pX, pY);
+            }
+
+            // 查询到库向量：切换为论文式估算
+            virtual float L2Distance(const float* rotated_query, const std::uint8_t* pY) const
+            {
+                return L2DistanceEstimate(rotated_query, pY, nullptr);
+            }
+
+            // 重载，额外接收查询元信息以避免重复计算
+            virtual float L2Distance(const float* rotated_query, const std::uint8_t* pY, const BondMeta bond_meta) const
+            {
+                return L2DistanceEstimate(rotated_query, pY, bond_meta, nullptr);
+            }
+
+            // 兼容入口：先预处理查询，再走估算
             virtual float L2Distance(const void* pX, const std::uint8_t* pY) const
             {
                 std::vector<float> temp_rot(m_PaddedDim);
@@ -496,7 +664,7 @@ namespace SPTAG
                 }
 
                 m_CodeSize = m_PaddedDim * 1;
-                m_MetaSize = 2 * sizeof(float);
+                m_MetaSize = sizeof(RaBitQEstimateMeta);
                 m_QuantizedSize = m_MetaSize + m_CodeSize;
             }
 

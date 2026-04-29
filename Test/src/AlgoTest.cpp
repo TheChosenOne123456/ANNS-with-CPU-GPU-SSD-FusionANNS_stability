@@ -347,34 +347,30 @@ BOOST_AUTO_TEST_CASE(VerifyRaBitQWrapperAccuracy_Float)
     for (int i = 0; i < n * dim; ++i) trainData[i] = static_cast<float>(rand() % 1000) / 1000.0f;
     quantizer->Train(trainData.data(), n);
 
+    // 假设vecA是查询向量，vecB是数据库中的一个向量，我们先计算它们的真实距离，然后通过 RaBitQ 的接口计算近似距离，并比较误差
     std::vector<float> vecA(dim), vecB(dim);
     for (int i = 0; i < dim; ++i) {
         vecA[i] = static_cast<float>(rand() % 1000) / 1000.0f;
         vecB[i] = static_cast<float>(rand() % 1000) / 1000.0f;
     }
 
-    std::vector<std::uint8_t> qA(quantizer->QuantizeSize()), qB(quantizer->QuantizeSize());
-    quantizer->QuantizeVector(vecA.data(), qA.data());
+    std::vector<std::uint8_t> qB(quantizer->QuantizeSize());
     quantizer->QuantizeVector(vecB.data(), qB.data());
 
     const float trueDist = SPTAG::COMMON::DistanceUtils::ComputeL2Distance(vecA.data(), vecB.data(), dim);
-    const float sdDist = quantizer->L2Distance(qA.data(), qB.data());
 
     std::vector<float> rotA(dim + 128, 0.0f);
     quantizer->PreprocessQuery(vecA.data(), rotA.data());
-    const float adcDist = quantizer->L2Distance(rotA.data(), qB.data());
+    const float estimateDist = quantizer->L2Distance(rotA.data(), qB.data());
 
     const float denom = std::max(trueDist, 1e-6f);
-    const float errSD = std::abs(trueDist - sdDist) / denom * 100.0f;
-    const float errADC = std::abs(trueDist - adcDist) / denom * 100.0f;
+    const float err = std::abs(trueDist - estimateDist) / denom * 100.0f;
 
     std::cout << "[float] True=" << trueDist
-              << " SD=" << sdDist
-              << " ADC=" << adcDist
-              << " errSD=" << errSD << "% errADC=" << errADC << "%" << std::endl;
+              << " Estimate=" << estimateDist
+              << " err=" << err << "%" << std::endl;
 
-    BOOST_CHECK_LT(errSD, 20.0f);
-    BOOST_CHECK_LT(errADC, 20.0f);
+    BOOST_CHECK_LT(err, 20.0f);
 }
 
 // 核心验证：uint8 wrapper 精度（模板类型不再依赖 Auto）
@@ -398,28 +394,23 @@ BOOST_AUTO_TEST_CASE(VerifyRaBitQWrapperAccuracy_UInt8)
         vecB[i] = static_cast<std::uint8_t>(rand() % 256);
     }
 
-    std::vector<std::uint8_t> qA(quantizer->QuantizeSize()), qB(quantizer->QuantizeSize());
-    quantizer->QuantizeVector(vecA.data(), qA.data());
+    std::vector<std::uint8_t> qB(quantizer->QuantizeSize());
     quantizer->QuantizeVector(vecB.data(), qB.data());
 
     const float trueDist = ComputeL2U8(vecA, vecB);
-    const float sdDist = quantizer->L2Distance(qA.data(), qB.data());
 
     std::vector<float> rotA(dim + 128, 0.0f);
     quantizer->PreprocessQuery(vecA.data(), rotA.data());
-    const float adcDist = quantizer->L2Distance(rotA.data(), qB.data());
+    const float estimateDist = quantizer->L2Distance(rotA.data(), qB.data());
 
     const float denom = std::max(trueDist, 1e-6f);
-    const float errSD = std::abs(trueDist - sdDist) / denom * 100.0f;
-    const float errADC = std::abs(trueDist - adcDist) / denom * 100.0f;
+    const float err = std::abs(trueDist - estimateDist) / denom * 100.0f;
 
     std::cout << "[uint8] True=" << trueDist
-              << " SD=" << sdDist
-              << " ADC=" << adcDist
-              << " errSD=" << errSD << "% errADC=" << errADC << "%" << std::endl;
+              << " Estimate=" << estimateDist
+              << " err=" << err << "%" << std::endl;
 
-    BOOST_CHECK_LT(errSD, 35.0f);
-    BOOST_CHECK_LT(errADC, 35.0f);
+    BOOST_CHECK_LT(err, 35.0f);
 }
 
 // 新增：验证 Save/Load 后 rotator 等信息被正确恢复（同输入得到同量化结果）
@@ -519,6 +510,8 @@ BOOST_AUTO_TEST_CASE(IntegrationTest_BuildIndexWithRaBitQ)
 
     SPTAG::QueryResult qr(data, 5, false);
     BOOST_CHECK(SPTAG::ErrorCode::Success == loaded->SearchIndex(qr));
+
+    std::cout << std::endl;
 }
 
 // 性能冒烟：确保路径可运行，不做强约束速度断言
@@ -526,9 +519,9 @@ BOOST_AUTO_TEST_CASE(RaBitQ_vs_Float32_Kernel_Benchmark)
 {
     std::cout << "\n[Benchmark] RaBitQ vs Float32..." << std::endl;
 
-    const int n = 1000;
+    const int n = 1000000;
     const int dim = 128;
-    const int repeats = 20000;
+    const int repeats = 100;
 
     std::vector<float> data(n * dim);
     for (int i = 0; i < n * dim; ++i) data[i] = static_cast<float>(rand() % 1000) / 1000.0f;
@@ -538,23 +531,40 @@ BOOST_AUTO_TEST_CASE(RaBitQ_vs_Float32_Kernel_Benchmark)
 
     auto rabitq = std::make_shared<SPTAG::COMMON::RaBitQQuantizer<float>>(dim);
     BOOST_REQUIRE(rabitq != nullptr);
+    rabitq->SetBitsPerCode(1);
     rabitq->Train(data.data(), n);
 
-    std::vector<std::uint8_t> qVec(rabitq->QuantizeSize());
-    rabitq->QuantizeVector(data.data(), qVec.data());
-
-    std::vector<float> rotQuery(dim + 128, 0.0f);
-    rabitq->PreprocessQuery(query.data(), rotQuery.data());
+    // 此处应该分别量化所有数据向量
+    std::vector<std::uint8_t> qData(n * rabitq->QuantizeSize());
+    for (int i = 0; i < n; ++i) {
+        rabitq->QuantizeVector(data.data() + i * dim, qData.data() + i * rabitq->QuantizeSize());
+    }
 
     auto start = std::chrono::high_resolution_clock::now();
     volatile float totalQ = 0;
-    for (int i = 0; i < repeats; ++i) totalQ += rabitq->L2Distance(rotQuery.data(), qVec.data());
+    for (int i = 0; i < repeats; ++i) {
+        std::vector<float> rotQuery(dim + 128, 0.0f);
+        rabitq->PreprocessQuery(query.data(), rotQuery.data());
+
+        SPTAG::COMMON::RaBitQQuantizer<float>::BondMeta bond_meta;
+        rabitq->BuildL2EstimateQueryFactors(rotQuery.data(), bond_meta);
+
+        for (int j = 0; j < n; ++j) {
+            totalQ += rabitq->L2Distance(rotQuery.data(), qData.data() + j * rabitq->QuantizeSize(), bond_meta);
+        }
+    }
+    
     auto end = std::chrono::high_resolution_clock::now();
     auto tQ = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 
     start = std::chrono::high_resolution_clock::now();
     volatile float totalF = 0;
-    for (int i = 0; i < repeats; ++i) totalF += SPTAG::COMMON::DistanceUtils::ComputeL2Distance(query.data(), data.data(), dim);
+    for (int i = 0; i < repeats; ++i) {
+        for (int j = 0; j < n; ++j) {
+            totalF += SPTAG::COMMON::DistanceUtils::ComputeL2Distance(query.data(), data.data() + j * dim, dim);
+        }
+    }
+
     end = std::chrono::high_resolution_clock::now();
     auto tF = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 
