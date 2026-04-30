@@ -28,6 +28,9 @@
 #include "rabitqlib/quantization/rabitq.hpp"
 #include "rabitqlib/utils/rotator.hpp"
 #include "rabitqlib/index/estimator.hpp"
+// 引入底层的位打包与专用内积函数
+#include "rabitqlib/quantization/pack_excode.hpp"
+#include "rabitqlib/utils/space.hpp"
 
 #include <immintrin.h> 
 
@@ -184,7 +187,7 @@ namespace SPTAG
                 float est = rabitqlib::quant::full_est_dist<float, uint8_t>(
                     code,
                     rotated_query,
-                    &RaBitQQuantizer<T>::IPFloatU8,
+                    m_PackedIpFunc, // 使用位压缩专用 SIMD 内核替换普通的 IPFloatU8
                     m_PaddedDim,
                     m_BitsPerCode,
                     meta->f_add,
@@ -201,7 +204,7 @@ namespace SPTAG
                 return est;
             }
 
-            // 重载，额外接收查询元信息以避免重复计算
+            // 重载，额外接收查询元信息以避免重复计算（建议使用）
             inline float L2DistanceEstimate(
                 const float* rotated_query,
                 const std::uint8_t* pY,
@@ -219,7 +222,7 @@ namespace SPTAG
                 float est = rabitqlib::quant::full_est_dist<float, uint8_t>(
                     code,
                     rotated_query,
-                    &RaBitQQuantizer<T>::IPFloatU8,
+                    m_PackedIpFunc,
                     m_PaddedDim,
                     m_BitsPerCode,
                     meta->f_add,
@@ -255,7 +258,7 @@ namespace SPTAG
                 }
             }
 
-            // 将原始向量量化为 4bit 码值并写入 meta 信息
+            // 将原始向量量化为指定码值并写入 meta 信息
             virtual void QuantizeVector(const void* vec, std::uint8_t* vecout, bool ADC = true) const
             {
                 (void)ADC;
@@ -272,6 +275,10 @@ namespace SPTAG
                 auto* meta = reinterpret_cast<RaBitQEstimateMeta*>(vecout);
                 uint8_t* bin_ptr = reinterpret_cast<uint8_t*>(vecout + m_MetaSize);
 
+                // 准备两个全尺寸的缓冲来接收量化结果
+                std::vector<uint8_t> temp_scalar_code(m_PaddedDim, 0);
+                std::vector<uint8_t> temp_full_code(m_PaddedDim, 0);
+
                 // 1) 保留原来的 scalar 量化（用于重构与旧路径兼容）
                 float delta = 0.0f;
                 float vl = 0.0f;
@@ -279,7 +286,7 @@ namespace SPTAG
                     rotated_vec.data(),
                     m_PaddedDim,
                     m_BitsPerCode,
-                    bin_ptr,
+                    temp_scalar_code.data(),
                     delta,
                     vl
                 );
@@ -288,13 +295,12 @@ namespace SPTAG
                 float f_add = 0.0f;
                 float f_rescale = 0.0f;
                 float f_error = 0.0f;
-                std::vector<uint8_t> check_code(m_PaddedDim, 0);
 
                 rabitqlib::quant::quantize_full_single<float, uint8_t>(
                     rotated_vec.data(),
                     m_PaddedDim,
                     m_BitsPerCode,
-                    check_code.data(),
+                    temp_full_code.data(),
                     f_add,
                     f_rescale,
                     f_error,
@@ -303,10 +309,18 @@ namespace SPTAG
 
             #ifndef NDEBUG
                 // 两条路径理论上应产生一致码字；调试期做一致性检查
-                if (std::memcmp(check_code.data(), bin_ptr, m_CodeSize) != 0) {
+                if (std::memcmp(temp_full_code.data(), temp_scalar_code.data(), m_PaddedDim) != 0) {
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Warning, "RaBitQ scalar/full code mismatch detected.\n");
                 }
             #endif
+
+                // 【新增】将 1-byte 宽度的临时量化码压缩成我们设定的比特位，压实到 bin_ptr 中
+                rabitqlib::quant::rabitq_impl::ex_bits::packing_rabitqplus_code(
+                    temp_full_code.data(), 
+                    bin_ptr, 
+                    m_PaddedDim, 
+                    m_BitsPerCode
+                );
 
                 meta->delta = delta;
                 meta->vl = vl;
@@ -326,8 +340,12 @@ namespace SPTAG
                 float delta = meta_ptr[0];
                 float vl = meta_ptr[1];
 
+                // 解压：先把紧凑存放的位数提取回一维一字节的格式进行后续常规重建
+                std::vector<uint8_t> raw_code(m_PaddedDim, 0);
+                UnpackVector(bin_ptr, raw_code.data());
+
                 rabitqlib::quant::reconstruct_vec(
-                    const_cast<uint8_t*>(bin_ptr),
+                    raw_code.data(),
                     delta,
                     vl,
                     m_PaddedDim,
@@ -533,14 +551,22 @@ namespace SPTAG
                 const uint8_t* binX = reinterpret_cast<const uint8_t*>(pX + m_MetaSize);
                 const uint8_t* binY = reinterpret_cast<const uint8_t*>(pY + m_MetaSize);
 
+                // 【新增解压操作】：
+                std::vector<uint8_t> rawX(m_PaddedDim);
+                std::vector<uint8_t> rawY(m_PaddedDim);
+                UnpackVector(binX, rawX.data());
+                UnpackVector(binY, rawY.data());
+                const uint8_t* u_binX = rawX.data();
+                const uint8_t* u_binY = rawY.data();
+
                 __m512 vDist = _mm512_setzero_ps();
                 DimensionType dim = m_PaddedDim;
                 DimensionType i = 0;
 
                 // AVX-512 Loop
                 for (; i + 15 < dim; i += 16) {
-                    __m512i intX = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)(binX + i)));
-                    __m512i intY = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)(binY + i)));
+                    __m512i intX = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)(u_binX + i)));
+                    __m512i intY = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)(u_binY + i)));
 
                     __m512 fX = _mm512_cvtepi32_ps(intX);
                     __m512 fY = _mm512_cvtepi32_ps(intY);
@@ -557,8 +583,8 @@ namespace SPTAG
 
                 // Scalar Tail
                 for (; i < dim; ++i) {
-                    float valX = static_cast<float>(binX[i]) * metaX[0] + metaX[1];
-                    float valY = static_cast<float>(binY[i]) * metaY[0] + metaY[1];
+                    float valX = static_cast<float>(u_binX[i]) * metaX[0] + metaX[1];
+                    float valY = static_cast<float>(u_binY[i]) * metaY[0] + metaY[1];
                     float diff = valX - valY;
                     dist += diff * diff;
                 }
@@ -608,15 +634,15 @@ namespace SPTAG
             }
 
             // 查询到库向量：切换为论文式估算
-            virtual float L2Distance(const float* rotated_query, const std::uint8_t* pY) const
+            virtual float L2Distance(const float* rotated_query, const std::uint8_t* pY, float* out_low_dist = nullptr) const
             {
-                return L2DistanceEstimate(rotated_query, pY, nullptr);
+                return L2DistanceEstimate(rotated_query, pY, out_low_dist);
             }
 
             // 重载，额外接收查询元信息以避免重复计算
-            virtual float L2Distance(const float* rotated_query, const std::uint8_t* pY, const BondMeta bond_meta) const
+            virtual float L2Distance(const float* rotated_query, const std::uint8_t* pY, const BondMeta bond_meta, float* out_low_dist = nullptr) const
             {
-                return L2DistanceEstimate(rotated_query, pY, bond_meta, nullptr);
+                return L2DistanceEstimate(rotated_query, pY, bond_meta, out_low_dist);
             }
 
             // 兼容入口：先预处理查询，再走估算
@@ -637,6 +663,45 @@ namespace SPTAG
                     }
                 } else {
                     std::memcpy(out_float, vec, m_Dim * sizeof(float));
+                }
+            }
+
+            // 还原解压函数（内部调试）
+            inline void UnpackVector(const uint8_t* in_compact, uint8_t* out_raw) const {
+                size_t dim = m_PaddedDim;
+                size_t bits = m_BitsPerCode;
+
+                if (bits == 8) {
+                    std::memcpy(out_raw, in_compact, dim);
+                } else if (bits == 4) {
+                    for (size_t j = 0; j < dim; j += 16) {
+                        uint64_t compact = *reinterpret_cast<const uint64_t*>(in_compact);
+                        *reinterpret_cast<uint64_t*>(out_raw) = compact & 0x0F0F0F0F0F0F0F0F;
+                        *reinterpret_cast<uint64_t*>(out_raw + 8) = (compact >> 4) & 0x0F0F0F0F0F0F0F0F;
+                        in_compact += 8;
+                        out_raw += 16;
+                    }
+                } else if (bits == 2) {
+                    for (size_t j = 0; j < dim; j += 16) {
+                        uint32_t compact = *reinterpret_cast<const uint32_t*>(in_compact);
+                        *reinterpret_cast<uint32_t*>(out_raw) = compact & 0x03030303;
+                        *reinterpret_cast<uint32_t*>(out_raw + 4) = (compact >> 2) & 0x03030303;
+                        *reinterpret_cast<uint32_t*>(out_raw + 8) = (compact >> 4) & 0x03030303;
+                        *reinterpret_cast<uint32_t*>(out_raw + 12) = (compact >> 6) & 0x03030303;
+                        in_compact += 4;
+                        out_raw += 16;
+                    }
+                } else if (bits == 1) {
+                    for (size_t j = 0; j < dim; j += 16) {
+                        uint16_t compact = *reinterpret_cast<const uint16_t*>(in_compact);
+                        for (size_t i = 0; i < 16; ++i) {
+                            out_raw[i] = (compact >> i) & 1;
+                        }
+                        in_compact += 2;
+                        out_raw += 16;
+                    }
+                } else {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Unsupported BitsPerCode: %d\n", bits);
                 }
             }
 
@@ -663,9 +728,12 @@ namespace SPTAG
                     m_PaddedDim = (m_Dim + 127) / 128 * 128;
                 }
 
-                m_CodeSize = m_PaddedDim * 1;
+                m_CodeSize = (m_PaddedDim * m_BitsPerCode + 7) / 8;
                 m_MetaSize = sizeof(RaBitQEstimateMeta);
                 m_QuantizedSize = m_MetaSize + m_CodeSize;
+
+                // 根据底层位宽分配对应的专属解包 SIMD 内核
+                m_PackedIpFunc = rabitqlib::select_excode_ipfunc(m_BitsPerCode);
             }
 
             // 提前算一下：如果要保存当前的旋转器，到底需要多少个字节的空间
@@ -779,6 +847,7 @@ namespace SPTAG
             SizeType m_MetaSize;    // 单条向量元信息字节数（当前是 delta 和 vl 两个 float）
             SizeType m_QuantizedSize;   // 单条向量总的量化后字节数（meta + code）
             SizeType m_BitsPerCode = 4; // 每个维度的量化位数（当前固定为 4）
+            rabitqlib::ex_ipfunc m_PackedIpFunc = nullptr; // 保存当前位数对应的 AVX512 最优解包内积函数
             mutable rabitqlib::Rotator<float>* m_Rotator;   // 旋转器指针（训练时选择，量化时使用）
             bool m_EnableADC;   // 是否启用 ADC 模式（影响距离计算接口行为）
             

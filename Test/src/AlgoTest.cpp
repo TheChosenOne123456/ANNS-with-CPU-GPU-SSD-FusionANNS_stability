@@ -343,6 +343,11 @@ BOOST_AUTO_TEST_CASE(VerifyRaBitQWrapperAccuracy_Float)
     auto quantizer = std::make_shared<SPTAG::COMMON::RaBitQQuantizer<float>>(dim);
     BOOST_REQUIRE(quantizer != nullptr);
 
+    // 指定量化bit数
+    int bits_per_code = 4;
+    quantizer->SetBitsPerCode(bits_per_code);
+    std::cout << "BitsPerCode=" << bits_per_code << std::endl;
+
     std::vector<float> trainData(n * dim);
     for (int i = 0; i < n * dim; ++i) trainData[i] = static_cast<float>(rand() % 1000) / 1000.0f;
     quantizer->Train(trainData.data(), n);
@@ -361,7 +366,14 @@ BOOST_AUTO_TEST_CASE(VerifyRaBitQWrapperAccuracy_Float)
 
     std::vector<float> rotA(dim + 128, 0.0f);
     quantizer->PreprocessQuery(vecA.data(), rotA.data());
-    const float estimateDist = quantizer->L2Distance(rotA.data(), qB.data());
+
+    // 计算误差界限信息
+    SPTAG::COMMON::RaBitQQuantizer<float>::BondMeta bond_meta;
+    quantizer->BuildL2EstimateQueryFactors(rotA.data(), bond_meta);
+
+    float lowDist = 0.0f;
+    const float estimateDist = quantizer->L2Distance(rotA.data(), qB.data(), bond_meta, &lowDist);
+    const float errorBound = estimateDist - lowDist;    // 误差界
 
     const float denom = std::max(trueDist, 1e-6f);
     const float err = std::abs(trueDist - estimateDist) / denom * 100.0f;
@@ -369,6 +381,10 @@ BOOST_AUTO_TEST_CASE(VerifyRaBitQWrapperAccuracy_Float)
     std::cout << "[float] True=" << trueDist
               << " Estimate=" << estimateDist
               << " err=" << err << "%" << std::endl;
+    
+    std::cout << "LowerBound=" << lowDist
+              << " ErrorBound=" << errorBound
+              << " IsSafePruning(" << (lowDist <= trueDist ? "Yes" : "No") << ")" << std::endl;
 
     BOOST_CHECK_LT(err, 20.0f);
 }
@@ -383,6 +399,11 @@ BOOST_AUTO_TEST_CASE(VerifyRaBitQWrapperAccuracy_UInt8)
 
     auto quantizer = std::make_shared<SPTAG::COMMON::RaBitQQuantizer<std::uint8_t>>(dim);
     BOOST_REQUIRE(quantizer != nullptr);
+
+    // 指定量化bit数
+    int bits_per_code = 4;
+    quantizer->SetBitsPerCode(bits_per_code);
+    std::cout << "BitsPerCode=" << bits_per_code << std::endl;
 
     std::vector<std::uint8_t> trainData(n * dim);
     for (int i = 0; i < n * dim; ++i) trainData[i] = static_cast<std::uint8_t>(rand() % 256);
@@ -401,7 +422,14 @@ BOOST_AUTO_TEST_CASE(VerifyRaBitQWrapperAccuracy_UInt8)
 
     std::vector<float> rotA(dim + 128, 0.0f);
     quantizer->PreprocessQuery(vecA.data(), rotA.data());
-    const float estimateDist = quantizer->L2Distance(rotA.data(), qB.data());
+
+    // 计算误差界限信息
+    SPTAG::COMMON::RaBitQQuantizer<std::uint8_t>::BondMeta bond_meta;
+    quantizer->BuildL2EstimateQueryFactors(rotA.data(), bond_meta);
+    
+    float lowDist = 0.0f;
+    const float estimateDist = quantizer->L2Distance(rotA.data(), qB.data(), bond_meta, &lowDist);
+    const float errorBound = estimateDist - lowDist;    // 误差界
 
     const float denom = std::max(trueDist, 1e-6f);
     const float err = std::abs(trueDist - estimateDist) / denom * 100.0f;
@@ -409,6 +437,10 @@ BOOST_AUTO_TEST_CASE(VerifyRaBitQWrapperAccuracy_UInt8)
     std::cout << "[uint8] True=" << trueDist
               << " Estimate=" << estimateDist
               << " err=" << err << "%" << std::endl;
+
+    std::cout << "LowerBound=" << lowDist
+              << " ErrorBound=" << errorBound
+              << " IsSafePruning(" << (lowDist <= trueDist ? "Yes" : "No") << ")" << std::endl;
 
     BOOST_CHECK_LT(err, 35.0f);
 }
@@ -531,7 +563,11 @@ BOOST_AUTO_TEST_CASE(RaBitQ_vs_Float32_Kernel_Benchmark)
 
     auto rabitq = std::make_shared<SPTAG::COMMON::RaBitQQuantizer<float>>(dim);
     BOOST_REQUIRE(rabitq != nullptr);
-    rabitq->SetBitsPerCode(1);
+
+    // 指定量化bit数
+    int bits_per_code = 2;
+    rabitq->SetBitsPerCode(bits_per_code);
+    std::cout << "BitsPerCode=" << bits_per_code << std::endl;
     rabitq->Train(data.data(), n);
 
     // 此处应该分别量化所有数据向量
@@ -604,6 +640,10 @@ BOOST_AUTO_TEST_CASE(RaBitQ_Search_Recall_Test)
 
     auto quantizer = std::make_shared<SPTAG::COMMON::RaBitQQuantizer<float>>(dim);
     BOOST_REQUIRE(quantizer != nullptr);
+    // 指定量化bit数
+    int bits_per_code = 2;
+    quantizer->SetBitsPerCode(bits_per_code);
+    std::cout << "BitsPerCode=" << bits_per_code << std::endl;
     index->SetQuantizer(quantizer);
 
     BOOST_REQUIRE(SPTAG::ErrorCode::Success == index->BuildIndex(vecSet, nullptr, false));
