@@ -610,6 +610,70 @@ BOOST_AUTO_TEST_CASE(RaBitQ_vs_Float32_Kernel_Benchmark)
     BOOST_CHECK_GT(tF, 0);
 }
 
+// 性能冒烟：确保路径可运行，不做强约束速度断言
+BOOST_AUTO_TEST_CASE(RaBitQ_vs_Uint8_Kernel_Benchmark)
+{
+    std::cout << "\n[Benchmark] RaBitQ vs Uint8..." << std::endl;
+
+    const int n = 1000000;
+    const int dim = 128;
+    const int repeats = 100;
+
+    std::vector<std::uint8_t> data(n * dim);
+    for (int i = 0; i < n * dim; ++i) data[i] = static_cast<std::uint8_t>(rand() % 256);
+
+    std::vector<std::uint8_t> query(dim);
+    for (int i = 0; i < dim; ++i) query[i] = static_cast<std::uint8_t>(rand() % 256);
+
+    auto rabitq = std::make_shared<SPTAG::COMMON::RaBitQQuantizer<std::uint8_t>>(dim);
+    BOOST_REQUIRE(rabitq != nullptr);
+
+    // 指定量化bit数
+    int bits_per_code = 2;
+    rabitq->SetBitsPerCode(bits_per_code);
+    std::cout << "BitsPerCode=" << bits_per_code << std::endl;
+    rabitq->Train(data.data(), n);
+
+    // 此处应该分别量化所有数据向量
+    std::vector<std::uint8_t> qData(n * rabitq->QuantizeSize());
+    for (int i = 0; i < n; ++i) {
+        rabitq->QuantizeVector(data.data() + i * dim, qData.data() + i * rabitq->QuantizeSize());
+    }
+
+    auto start = std::chrono::high_resolution_clock::now();
+    volatile float totalQ = 0;
+    for (int i = 0; i < repeats; ++i) {
+        std::vector<float> rotQuery(dim + 128, 0.0f);
+        rabitq->PreprocessQuery(query.data(), rotQuery.data());
+
+        SPTAG::COMMON::RaBitQQuantizer<std::uint8_t>::BondMeta bond_meta;
+        rabitq->BuildL2EstimateQueryFactors(rotQuery.data(), bond_meta);
+
+        for (int j = 0; j < n; ++j) {
+            totalQ += rabitq->L2Distance(rotQuery.data(), qData.data() + j * rabitq->QuantizeSize(), bond_meta);
+        }
+    }
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    auto tQ = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+
+    start = std::chrono::high_resolution_clock::now();
+    volatile float totalI = 0;
+    for (int i = 0; i < repeats; ++i) {
+        for (int j = 0; j < n; ++j) {
+            totalI += ComputeL2U8(query, std::vector<std::uint8_t>(data.data() + j * dim, data.data() + (j+1) * dim));
+        }
+    }
+
+    end = std::chrono::high_resolution_clock::now();
+    auto tI = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+
+    std::cout << "[RaBitQ]  " << repeats << " ops: " << tQ << " us, sum=" << totalQ << std::endl;
+    std::cout << "[Uint8] " << repeats << " ops: " << tI << " us, sum=" << totalI << std::endl;
+    BOOST_CHECK_GT(tQ, 0);
+    BOOST_CHECK_GT(tI, 0);
+}
+
 // 召回率/延迟/存储（缩小规模，保证单测可跑通）
 BOOST_AUTO_TEST_CASE(RaBitQ_Search_Recall_Test)
 {
