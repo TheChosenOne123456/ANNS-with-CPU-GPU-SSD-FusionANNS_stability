@@ -20,14 +20,23 @@ using namespace SPTAG;
 namespace SPTAG {
 	namespace SSDServing {
 
-		int BootProgram(bool forANNIndexTestTool, 
-			std::map<std::string, std::map<std::string, std::string>>* config_map, 
-			const char* configurationPath, 
-			VectorValueType valueType,
-			DistCalcMethod distCalcMethod,
-			const char* dataFilePath, 
+		int BootProgram(bool forANNIndexTestTool, 	// 决定走“测试/工具模式”还是“读 ini 文件模式”
+			std::map<std::string, std::map<std::string, std::string>>* config_map, 	// 按 section 分组的配置容器，最后会被塞进 index
+			const char* configurationPath, 	// ssdserving.ini
+			VectorValueType valueType,	// 向量类型
+			DistCalcMethod distCalcMethod,	// 距离类型
+			const char* dataFilePath, 	// 仅在工具模式下使用，分别代表原始向量文件和索引目录
 			const char* indexFilePath) {
 
+			// 如果 forANNIndexTestTool 为真，main.cpp:31-69 会直接往 config_map 里写默认参数，
+			// 相当于绕过 ini 文件，强行构造一套可跑的建索引配置。这里还会读取 QuantizerFilePath，说明测试模式也支持量化器
+			// 如果为假，main.cpp:70-92 就从 ini 文件读取 Base、SelectHead、BuildHead、BuildSSDIndex 四个 section，
+			// 并且把 SearchSSDIndex 的参数合并进 BuildSSDIndex。这里有个很重要的细节，
+			// PostingPageLimit 会改名成 SearchPostingPageLimit，InternalResultNum 会改名成 SearchInternalResultNum，
+			// 说明搜索相关参数最终也参与 SSD 建索引阶段的配置归并。
+
+			// 调试，打印配置文件路径
+			std::cout << "configurationPath = " << configurationPath << std::endl;
 
 			bool searchSSD = false;
 			std::string QuantizerFilePath = "";
@@ -61,6 +70,7 @@ namespace SPTAG {
 			else {
 				Helper::IniReader iniReader;
 				iniReader.LoadIniFile(configurationPath);
+				// config_map分成了四个板块
 				(*config_map)[SEC_BASE] = iniReader.GetParameters(SEC_BASE);
 				(*config_map)[SEC_SELECT_HEAD] = iniReader.GetParameters(SEC_SELECT_HEAD);
 				(*config_map)[SEC_BUILD_HEAD] = iniReader.GetParameters(SEC_BUILD_HEAD);
@@ -85,6 +95,7 @@ namespace SPTAG {
 
 			SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Set QuantizerFile = %s\n", QuantizerFilePath.c_str());
 
+			// 外层索引是 SPANN，不是 BKT
 			std::shared_ptr<VectorIndex> index = VectorIndex::CreateInstance(IndexAlgoType::SPANN, valueType);
 			if (!QuantizerFilePath.empty() && index->LoadQuantizer(QuantizerFilePath) != ErrorCode::Success)
 			{
@@ -94,13 +105,18 @@ namespace SPTAG {
 				SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Cannot create Index with ValueType %s!\n", (*config_map)[SEC_BASE]["ValueType"].c_str());
 				return -1;
 			}
-
+			
+			// 对应输出中的一堆setting...
 			for (auto& sectionKV : *config_map) {
 				for (auto& KV : sectionKV.second) {
 					index->SetParameter(KV.first, KV.second, sectionKV.first);
 				}
 			}
 
+			// 调用链是 main.cpp:106-107 -> VectorIndex.cpp:432-450 -> SPANNIndex.cpp:1846-1968
+			// BuildIndexInternal函数
+			// Begin Select Head...等等
+			// 一直到输出的[1] select head time: 0.00s build head time: 0.00s build ssd time: 63.00s
 			if (index->BuildIndex() != ErrorCode::Success) {
 				SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to build index.\n");
 				exit(1);

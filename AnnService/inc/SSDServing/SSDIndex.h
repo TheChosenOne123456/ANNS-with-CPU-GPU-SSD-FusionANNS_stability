@@ -249,6 +249,9 @@ namespace SPTAG
             template <typename ValueType>
             void Search(SPANN::Index<ValueType> *p_index)
             {
+                // µ÷ÊÔ
+                std::cout << "Begin Search..." << std::endl;
+
                 SPANN::Options &p_opts = *(p_index->GetOptions());
                 std::string outputFile = p_opts.m_searchResult;
                 std::string truthFile = p_opts.m_truthPath;
@@ -286,6 +289,7 @@ namespace SPTAG
                     auto vectorReader = Helper::VectorSetReader::CreateInstance(vectorOptions);
                     if (ErrorCode::Success == vectorReader->LoadFile(QuantizervectorFilePath))
                     {
+                        // ´òÓ¡Load Vector(1000000000,32)
                         PQVectorSet = vectorReader->GetVectorSet();
                     }
                 }
