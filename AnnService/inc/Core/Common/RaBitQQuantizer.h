@@ -254,6 +254,9 @@ namespace SPTAG
                             m_Dim, rabitqlib::RotatorType::FhtKacRotator
                         );
                     }
+                    // m_Rotator = rabitqlib::choose_rotator<float>(
+                    //         m_Dim, rabitqlib::RotatorType::FhtKacRotator
+                    //     );
                     RecalcSizes();
                 }
             }

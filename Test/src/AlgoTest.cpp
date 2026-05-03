@@ -16,6 +16,10 @@
 
 #include <fstream> // 需要增加这个头文件用于计算文件大小
 
+#include <random>
+#include <cmath>
+#include "inc/Helper/VectorSetReader.h"
+
 template <typename T>
 void Build(SPTAG::IndexAlgoType algo, std::string distCalcMethod, std::shared_ptr<SPTAG::VectorSet>& vec, std::shared_ptr<SPTAG::MetadataSet>& meta, const std::string out)
 {
@@ -629,7 +633,7 @@ BOOST_AUTO_TEST_CASE(RaBitQ_vs_Uint8_Kernel_Benchmark)
     BOOST_REQUIRE(rabitq != nullptr);
 
     // 指定量化bit数
-    int bits_per_code = 2;
+    int bits_per_code = 4;
     rabitq->SetBitsPerCode(bits_per_code);
     std::cout << "BitsPerCode=" << bits_per_code << std::endl;
     rabitq->Train(data.data(), n);
@@ -785,6 +789,233 @@ BOOST_AUTO_TEST_CASE(RaBitQ_Search_Recall_Test)
               << "%, Perfect rate: " << perfectRate << "%" << std::endl;
 
     BOOST_CHECK_GT(avgOverlap, 60.0);
+}
+
+BOOST_AUTO_TEST_CASE(RaBitQ_RealData_EstimateVsTrue)
+{
+    const std::string root = "/home/ANNS_SSD/tyh/SIFT1B_data/";
+    const std::string quantizerPath = root + "2bits_rabitq_quantizer";
+    const std::string codePath = root + "base_2bits_rabitq.1B.u8bin";
+    const std::string basePath = root + "base.1B.u8bin";
+
+    const int Q = 10000; // 查询向量数（外层）
+    const int K = 10000; // 每次查询随机比较的量化向量数（内层）
+    const int poolN = std::max(Q, K);
+
+    auto ptr_vector = SPTAG::f_createIO();
+    BOOST_REQUIRE(ptr_vector != nullptr);
+    BOOST_REQUIRE(ptr_vector->Initialize(codePath.c_str(), std::ios::binary | std::ios::in));
+    int qcount = 0, qdim = 0;
+    BOOST_REQUIRE_EQUAL(ptr_vector->ReadBinary(sizeof(qcount), reinterpret_cast<char*>(&qcount)), sizeof(qcount));
+    BOOST_REQUIRE_EQUAL(ptr_vector->ReadBinary(sizeof(qdim), reinterpret_cast<char*>(&qdim)), sizeof(qdim));
+    ptr_vector.reset();
+
+    std::shared_ptr<SPTAG::VectorSet> qSet;
+    {
+        auto vectorOptions = std::make_shared<SPTAG::Helper::ReaderOptions>(
+            SPTAG::VectorValueType::UInt8,
+            qdim,
+            SPTAG::VectorFileType::DEFAULT);
+        auto vectorReader = SPTAG::Helper::VectorSetReader::CreateInstance(vectorOptions);
+        BOOST_REQUIRE(vectorReader != nullptr);
+        BOOST_REQUIRE(SPTAG::ErrorCode::Success == vectorReader->LoadFile(codePath));
+        qSet = vectorReader->GetVectorSet(0, poolN);
+        BOOST_REQUIRE(qSet != nullptr);
+    }
+    int actualQCount = static_cast<int>(std::min<int>(poolN, (int)qSet->Count()));
+
+    auto ptr_base = SPTAG::f_createIO();
+    BOOST_REQUIRE(ptr_base != nullptr);
+    BOOST_REQUIRE(ptr_base->Initialize(basePath.c_str(), std::ios::binary | std::ios::in));
+    int bcount = 0, bdim = 0;
+    BOOST_REQUIRE_EQUAL(ptr_base->ReadBinary(sizeof(bcount), reinterpret_cast<char*>(&bcount)), sizeof(bcount));
+    BOOST_REQUIRE_EQUAL(ptr_base->ReadBinary(sizeof(bdim), reinterpret_cast<char*>(&bdim)), sizeof(bdim));
+    ptr_base.reset();
+
+    std::shared_ptr<SPTAG::VectorSet> baseSet;
+    {
+        auto baseOptions = std::make_shared<SPTAG::Helper::ReaderOptions>(
+            SPTAG::VectorValueType::UInt8,
+            bdim,
+            SPTAG::VectorFileType::DEFAULT);
+        auto baseReader = SPTAG::Helper::VectorSetReader::CreateInstance(baseOptions);
+        BOOST_REQUIRE(baseReader != nullptr);
+        BOOST_REQUIRE(SPTAG::ErrorCode::Success == baseReader->LoadFile(basePath));
+        baseSet = baseReader->GetVectorSet(0, poolN);
+        BOOST_REQUIRE(baseSet != nullptr);
+    }
+    int actualBCount = static_cast<int>(std::min<int>(poolN, (int)baseSet->Count()));
+    BOOST_REQUIRE_EQUAL(bdim, bdim); // noop, keep type checks visible
+
+    auto ptr_q = SPTAG::f_createIO();
+    BOOST_REQUIRE(ptr_q != nullptr);
+    BOOST_REQUIRE(ptr_q->Initialize(quantizerPath.c_str(), std::ios::binary | std::ios::in));
+    auto iquant = SPTAG::COMMON::IQuantizer::LoadIQuantizer(ptr_q);
+    BOOST_REQUIRE(iquant != nullptr);
+    auto rtype = iquant->GetReconstructType();
+
+    std::mt19937 rng(123456);
+    std::uniform_int_distribution<int> distIdx(0, std::min(actualQCount, actualBCount) - 1);
+
+    double totalEstimateTimeUs = 0.0, totalTrueTimeUs = 0.0;
+    double sumRelErr = 0.0;
+    uint64_t totalComparisons = 0;
+    uint64_t violations_below_lower = 0;
+    uint64_t violations_above_upper = 0;
+
+    const float EPS = 1e-6f;
+
+    if (rtype == SPTAG::VectorValueType::UInt8)
+    {
+        auto rq = std::dynamic_pointer_cast<SPTAG::COMMON::RaBitQQuantizer<std::uint8_t>>(iquant);
+        BOOST_REQUIRE(rq != nullptr);
+
+        std::vector<float> rotBuf(bdim + 128 + 8, 0.0f);
+
+        for (int qi = 0; qi < Q; ++qi)
+        {
+            int qIdx = qi % actualBCount;
+            const std::uint8_t* queryVec = reinterpret_cast<const std::uint8_t*>(baseSet->GetVector(qIdx));
+
+            // PreprocessQuery + build bond_meta (not timed into estimate loop)
+            rq->PreprocessQuery(queryVec, rotBuf.data());
+            SPTAG::COMMON::RaBitQQuantizer<std::uint8_t>::BondMeta bond;
+            rq->BuildL2EstimateQueryFactors(rotBuf.data(), bond);
+
+            // 先采样 K 个索引（保证估计与真实距离分别计时）
+            std::vector<int> sampledIdx(K);
+            for (int ki = 0; ki < K; ++ki) sampledIdx[ki] = distIdx(rng) % actualBCount;
+
+            // 估计循环（单独计时）
+            std::vector<float> estimates(K);
+            std::vector<float> lowBounds(K);
+            auto t_est_start = std::chrono::high_resolution_clock::now();
+            for (int ki = 0; ki < K; ++ki)
+            {
+                const uint8_t* codePtr = reinterpret_cast<const uint8_t*>(qSet->GetVector(sampledIdx[ki]));
+                float lowBound = 0.0f;
+                float est = rq->L2Distance(rotBuf.data(), codePtr, bond, &lowBound);
+                estimates[ki] = est;
+                lowBounds[ki] = lowBound;
+            }
+            auto t_est_end = std::chrono::high_resolution_clock::now();
+            totalEstimateTimeUs += std::chrono::duration_cast<std::chrono::microseconds>(t_est_end - t_est_start).count();
+
+            // 真实距离循环（单独计时并统计违例）
+            auto t_true_start = std::chrono::high_resolution_clock::now();
+            for (int ki = 0; ki < K; ++ki)
+            {
+                int dbIdx = sampledIdx[ki];
+                const uint8_t* trueVec = reinterpret_cast<const uint8_t*>(baseSet->GetVector(dbIdx));
+
+                float trueDist = 0.0f;
+                for (int d = 0; d < bdim; ++d)
+                {
+                    float diff = static_cast<float>(queryVec[d]) - static_cast<float>(trueVec[d]);
+                    trueDist += diff * diff;
+                }
+
+                float est = estimates[ki];
+                float lowBound = lowBounds[ki];
+                float errorBound = est - lowBound;
+                float upperBound = est + errorBound; // 对称近似上界用于检验是否存在上界
+
+                if (trueDist + 1e-6f < lowBound) ++violations_below_lower;
+                if (trueDist > upperBound + 1e-6f) ++violations_above_upper;
+
+                float rel = (trueDist > EPS) ? (std::abs(est - trueDist) / trueDist) : 0.0f;
+                sumRelErr += std::min(rel, 1.0f);
+                ++totalComparisons;
+            }
+            auto t_true_end = std::chrono::high_resolution_clock::now();
+            totalTrueTimeUs += std::chrono::duration_cast<std::chrono::microseconds>(t_true_end - t_true_start).count();
+        }
+    }
+    else if (rtype == SPTAG::VectorValueType::Float)
+    {
+        auto rqf = std::dynamic_pointer_cast<SPTAG::COMMON::RaBitQQuantizer<float>>(iquant);
+        BOOST_REQUIRE(rqf != nullptr);
+
+        std::vector<float> rotBuf(bdim + 128 + 8, 0.0f);
+
+        for (int qi = 0; qi < Q; ++qi)
+        {
+            int qIdx = qi % actualBCount;
+            const std::uint8_t* rawQueryU8 = reinterpret_cast<const std::uint8_t*>(baseSet->GetVector(qIdx));
+            std::vector<float> queryF(bdim);
+            for (int d = 0; d < bdim; ++d) queryF[d] = static_cast<float>(rawQueryU8[d]);
+
+            rqf->PreprocessQuery(queryF.data(), rotBuf.data());
+            SPTAG::COMMON::RaBitQQuantizer<float>::BondMeta bond;
+            rqf->BuildL2EstimateQueryFactors(rotBuf.data(), bond);
+
+            std::vector<int> sampledIdx(K);
+            for (int ki = 0; ki < K; ++ki) sampledIdx[ki] = distIdx(rng) % actualBCount;
+
+            std::vector<float> estimates(K);
+            std::vector<float> lowBounds(K);
+            auto t_est_start = std::chrono::high_resolution_clock::now();
+            for (int ki = 0; ki < K; ++ki)
+            {
+                const uint8_t* codePtr = reinterpret_cast<const uint8_t*>(qSet->GetVector(sampledIdx[ki]));
+                float lowBound = 0.0f;
+                float est = rqf->L2Distance(rotBuf.data(), codePtr, bond, &lowBound);
+                estimates[ki] = est;
+                lowBounds[ki] = lowBound;
+            }
+            auto t_est_end = std::chrono::high_resolution_clock::now();
+            totalEstimateTimeUs += std::chrono::duration_cast<std::chrono::microseconds>(t_est_end - t_est_start).count();
+
+            auto t_true_start = std::chrono::high_resolution_clock::now();
+            for (int ki = 0; ki < K; ++ki)
+            {
+                int dbIdx = sampledIdx[ki];
+                const uint8_t* trueVecU8 = reinterpret_cast<const uint8_t*>(baseSet->GetVector(dbIdx));
+
+                float trueDist = 0.0f;
+                for (int d = 0; d < bdim; ++d)
+                {
+                    float diff = queryF[d] - static_cast<float>(trueVecU8[d]);
+                    trueDist += diff * diff;
+                }
+
+                float est = estimates[ki];
+                float lowBound = lowBounds[ki];
+                float errorBound = est - lowBound;
+                float upperBound = est + errorBound;
+
+                if (trueDist + 1e-6f < lowBound) ++violations_below_lower;
+                if (trueDist > upperBound + 1e-6f) ++violations_above_upper;
+
+                float rel = (trueDist > EPS) ? (std::abs(est - trueDist) / trueDist) : 0.0f;
+                sumRelErr += std::min(rel, 1.0f);
+                ++totalComparisons;
+            }
+            auto t_true_end = std::chrono::high_resolution_clock::now();
+            totalTrueTimeUs += std::chrono::duration_cast<std::chrono::microseconds>(t_true_end - t_true_start).count();
+        }
+    }
+    else
+    {
+        BOOST_FAIL("Unsupported quantizer reconstruct type for this test.");
+    }
+
+    double avgRelErr = (totalComparisons > 0) ? (sumRelErr / totalComparisons) : 0.0;
+    double avgEstimateTimePerCompUs = (totalComparisons > 0) ? (totalEstimateTimeUs / totalComparisons) : 0.0;
+    double avgTrueTimePerCompUs = (totalComparisons > 0) ? (totalTrueTimeUs / totalComparisons) : 0.0;
+
+    uint64_t countViolations = violations_below_lower + violations_above_upper;
+
+    std::cout << "Total comparisons: " << totalComparisons << std::endl;
+    std::cout << "Violations below lower bound: " << violations_below_lower << std::endl;
+    std::cout << "Violations above upper bound: " << violations_above_upper << std::endl;
+    std::cout << "Violations (sum): " << countViolations << std::endl;
+    std::cout << "Average relative error (capped at 1): " << avgRelErr << std::endl;
+    std::cout << "Avg estimate time per comp (us): " << avgEstimateTimePerCompUs << std::endl;
+    std::cout << "Avg true L2 time per comp (us): " << avgTrueTimePerCompUs << std::endl;
+
+    // 断言：无过多违例（阈值可调，保持和之前一致）
+    BOOST_CHECK_LT(static_cast<double>(countViolations) / std::max<uint64_t>(1, totalComparisons), 0.05); // 违例比例 < 5%
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -7,7 +7,7 @@
 #include <inc/Core/VectorSet.h>
 #include "inc/Core/Common/BKTree.h"
 
-#define SPTAG_BLOCK_ROWS 4096
+#define blockRows 4096
 using namespace SPTAG;
 
 class QuantizerOptions : public Helper::ReaderOptions
@@ -74,7 +74,7 @@ std::unique_ptr<T[]> TrainPQQuantizer(std::shared_ptr<QuantizerOptions> options,
     for (int codebookIdx = 0; codebookIdx < options->m_quantizedDim; codebookIdx++) {
         SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Training Codebook %d.\n", codebookIdx);
         auto kargs = COMMON::KmeansArgs<T>(numCentroids, subdim, raw_vectors->Count(), options->m_threadNum, DistCalcMethod::L2, nullptr);
-        auto dset = COMMON::Dataset<T>(raw_vectors->Count(), subdim, SPTAG_BLOCK_ROWS, raw_vectors->Count());
+        auto dset = COMMON::Dataset<T>(raw_vectors->Count(), subdim, blockRows, raw_vectors->Count());
 
         for (int vectorIdx = 0; vectorIdx < raw_vectors->Count(); vectorIdx++) {
             auto raw_addr = reinterpret_cast<T*>(raw_vectors->GetVector(vectorIdx)) + (codebookIdx * subdim);

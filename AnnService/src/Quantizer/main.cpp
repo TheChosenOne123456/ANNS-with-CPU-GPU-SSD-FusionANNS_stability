@@ -7,6 +7,7 @@
 #include "inc/Helper/SimpleIniReader.h"
 #include <inc/Core/Common/DistanceUtils.h>
 #include "inc/Quantizer/Training.h"
+#include "inc/Core/Common/RaBitQQuantizer.h"
 
 #include <memory>
 
@@ -27,8 +28,11 @@ void QuantizeAndSave(std::shared_ptr<SPTAG::Helper::VectorSetReader>& vectorRead
             SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Normalizing vectors.\n");
             set->Normalize(options->m_threadNum);
         }
-        ByteArray PQ_vector_array = ByteArray::Alloc(sizeof(std::uint8_t) * options->m_quantizedDim * set->Count());
-        quantized_vectors = std::make_shared<BasicVectorSet>(PQ_vector_array, VectorValueType::UInt8, options->m_quantizedDim, set->Count());
+        // ByteArray PQ_vector_array = ByteArray::Alloc(sizeof(std::uint8_t) * options->m_quantizedDim * set->Count());
+        // quantized_vectors = std::make_shared<BasicVectorSet>(PQ_vector_array, VectorValueType::UInt8, options->m_quantizedDim, set->Count());
+        SizeType quantizedBytes = quantizer->QuantizeSize();
+        ByteArray quantized_array = ByteArray::Alloc(sizeof(std::uint8_t) * quantizedBytes * set->Count());
+        quantized_vectors = std::make_shared<BasicVectorSet>(quantized_array, VectorValueType::UInt8, (DimensionType)quantizedBytes, set->Count());
 
 #pragma omp parallel for
         for (int i = 0; i < set->Count(); i++)
@@ -185,6 +189,70 @@ int main(int argc, char* argv[])
 
         break;
     }
+
+    // 这里把 -qd 复用成 RaBitQ 的 bits per code（1/2/4/8）
+    case QuantizerType::RaBitQQuantizer:
+    {
+        std::shared_ptr<COMMON::IQuantizer> quantizer;
+        auto fp_load = SPTAG::f_createIO();
+        if (fp_load == nullptr || !fp_load->Initialize(options->m_outputQuantizerFile.c_str(), std::ios::binary | std::ios::in))
+        {
+            auto set = vectorReader->GetVectorSet(0, options->m_trainingSamples);
+            SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "RaBitQ quantizer does not exist. Training a new one.\n");
+
+            switch (options->m_inputValueType)
+            {
+                case VectorValueType::Float: {
+                    auto rq = std::make_shared<COMMON::RaBitQQuantizer<float>>(options->m_dimension);
+                    if (options->m_quantizedDim > 0) rq->SetBitsPerCode((SizeType)options->m_quantizedDim);
+                    rq->Train(set->GetData(), set->Count());
+                    quantizer = rq;
+                    break;
+                }
+                case VectorValueType::UInt8: {
+                    auto rq = std::make_shared<COMMON::RaBitQQuantizer<std::uint8_t>>(options->m_dimension);
+                    if (options->m_quantizedDim > 0) rq->SetBitsPerCode((SizeType)options->m_quantizedDim);
+                    rq->Train(set->GetData(), set->Count());
+                    quantizer = rq;
+                    break;
+                }
+                default:
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "RaBitQ only supports Float and UInt8 inputs.\n");
+                    exit(1);
+            }
+
+            auto ptr = SPTAG::f_createIO();
+            if (ptr != nullptr && ptr->Initialize(options->m_outputQuantizerFile.c_str(), std::ios::binary | std::ios::out))
+            {
+                if (ErrorCode::Success != quantizer->SaveQuantizer(ptr))
+                {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to write RaBitQ quantizer file.\n");
+                    exit(1);
+                }
+            }
+        }
+        else
+        {
+            quantizer = SPTAG::COMMON::IQuantizer::LoadIQuantizer(fp_load);
+            if (!quantizer)
+            {
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to open existing RaBitQ quantizer file.\n");
+                exit(1);
+            }
+            quantizer->SetEnableADC(false);
+        }
+
+        QuantizeAndSave(vectorReader, options, quantizer);
+
+        auto metadataSet = vectorReader->GetMetadataSet();
+        if (metadataSet)
+        {
+            metadataSet->SaveMetadata(options->m_outputMetadataFile, options->m_outputMetadataIndexFile);
+        }
+
+        break;
+    }
+
     default:
     {
         SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to read quantizer type.\n");

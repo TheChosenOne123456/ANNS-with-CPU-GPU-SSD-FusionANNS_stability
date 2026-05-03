@@ -257,8 +257,10 @@ namespace SPTAG
                 std::string truthFile = p_opts.m_truthPath;
                 std::string warmupFile = p_opts.m_warmupPath;
 
+                // 测试结果：p_index->m_pQuantizer是nullptr, 说明没有使用量化器
                 if (p_index->m_pQuantizer)
                 {
+                    // std::cout << "p_index has quantizer" << std::endl;
                     p_index->m_pQuantizer->SetEnableADC(p_opts.m_enableADC);
                 }
 
