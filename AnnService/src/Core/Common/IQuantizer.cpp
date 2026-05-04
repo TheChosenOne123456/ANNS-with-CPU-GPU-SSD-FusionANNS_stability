@@ -37,6 +37,7 @@ namespace SPTAG
                 if (ret->LoadQuantizer(p_in) != ErrorCode::Success) ret.reset();
                 return ret;
             case QuantizerType::RaBitQQuantizer:
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Resetting Quantizer to type RaBitQQuantizer!\n");
                 switch (reconstructType) {
                 case VectorValueType::Float:
                     ret.reset(new RaBitQQuantizer<float>());

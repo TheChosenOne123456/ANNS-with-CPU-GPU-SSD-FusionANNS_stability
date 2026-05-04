@@ -110,15 +110,16 @@ namespace SPTAG
             template <typename ValueType>
             void SearchSequential(SPANN::Index<ValueType>* p_index,
                 int p_numThreads,
-                std::vector<QueryResult>& p_results,
+                std::vector<QueryResult>& p_results,    // 存internalResultNum 个最近的聚类中心
                 std::vector<SPANN::SearchStats>& p_stats,
                 int p_maxQueryCount, int p_internalResultNum,
                 std::shared_ptr<SPTAG::VectorSet> querySet,
                 std::shared_ptr<SPTAG::VectorSet> PQVectorSet,
                 std::shared_ptr<SPTAG::VectorSet> rerankVectorSet,
-                int PQVectorCount, int PQVectorDim, std::vector<int>& numVecPerPostinglist, std::vector<std::unique_ptr<int[]>>& postinglist, void* d_PQVectorSet,
+                int QuantizedVectorCount, int QuantizedVectorDim, std::vector<int>& numVecPerPostinglist, std::vector<std::unique_ptr<int[]>>& postinglist, void* d_PQVectorSet,
                 uint8_t *d_table, int* d_vectorIDs, float *d_dist, float *h_dist, int totalNumVec, std::shared_ptr<SPTAG::COMMON::IQuantizer> quantizer, bool isWarmup)
             {
+                // ========== 1. 初始化查询数量与线程 ==========
                 int numQueries = min(static_cast<int>(p_results.size()), p_maxQueryCount);
 
                 std::atomic_size_t queriesSent(0);
@@ -129,7 +130,8 @@ namespace SPTAG
 
                 SPANN::Options &p_opts = *(p_index->GetOptions());
 
-                Utils::StopW sw;
+                // ========== 2. 启动多个工作线程，每个线程不断取查询处理 ==========
+                Utils::StopW sw;    // 用于统计整体发送耗时
                 for (int i = 0; i < p_numThreads; i++)
                 {
                     threads.emplace_back([&, i]()
@@ -137,40 +139,51 @@ namespace SPTAG
                     NumaStrategy ns = (p_index->GetDiskIndex() != nullptr) ? NumaStrategy::SCATTER : NumaStrategy::LOCAL; // Only for SPANN, we need to avoid IO threads overlap with search threads.
                     Helper::SetThreadAffinity(i, threads[i], ns, OrderStrategy::ASC); 
 
-                    Utils::StopW threadws;
+                    Utils::StopW threadws;  // 单个查询的计时器
                     size_t index = 0;
                     while (true)
                     {
+                        // 原子获取下一个查询的编号
                         index = queriesSent.fetch_add(1);
                         if (index < numQueries)
                         {
+                            // 每 16384 个查询打印一次进度
                             if ((index & ((1 << 14) - 1)) == 0)
                             {
                                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Sent %.2lf%%...\n", index * 100.0 / numQueries);
                             }
 
+                            // -------- 阶段 A：内存 head 索引搜索（粗排）--------
                             double startTime = threadws.getElapsedMs();
                             p_index->GetMemoryIndex()->SearchIndex(p_results[index]);
                             double endTime = threadws.getElapsedMs();
 
+                            // 设置新 PQ 目标，供后续量化距离计算使用
                             (*((COMMON::QueryResultSet<ValueType> *)&p_results[index])).Setmy_newPQTarget(quantizer);
-                            std::unordered_set<int> postingIDSet;
+                            std::unordered_set<int> postingIDSet;   // 记录访问过的向量 ID（可能用于去重等）
+                            
+                            // -------- 阶段 B：量化倒排查找（细排，含 SSD 读取）--------
                             if(p_opts.m_enableGPU)
                             {
-                                p_index->SearchPQIndex_GPU(p_results[index], PQVectorCount, PQVectorDim, numVecPerPostinglist, postinglist, d_PQVectorSet, d_table, d_vectorIDs, d_dist, h_dist, totalNumVec, i, postingIDSet, &(p_stats[index]));
+                                // GPU 版本：从显存中的 PQ 码计算近似距离
+                                p_index->SearchPQIndex_GPU(p_results[index], QuantizedVectorCount, QuantizedVectorDim, numVecPerPostinglist, postinglist, d_PQVectorSet, d_table, d_vectorIDs, d_dist, h_dist, totalNumVec, i, postingIDSet, &(p_stats[index]));
                             }else{
-                                p_index->SearchPQIndex_CPU(p_results[index], PQVectorSet, PQVectorCount, PQVectorDim, numVecPerPostinglist, postinglist, postingIDSet, &(p_stats[index]));
+                                // CPU 版本（较少使用）
+                                p_index->SearchPQIndex_CPU(p_results[index], PQVectorSet, QuantizedVectorCount, QuantizedVectorDim, numVecPerPostinglist, postinglist, postingIDSet, &(p_stats[index]));
                             }
                             
                             double searchEndTime = threadws.getElapsedMs();
 
+                            // -------- 阶段 C：重排序（rerank）--------
                             if (p_opts.m_enableReorderIndex)
                             {
+                                // 利用重排序索引加速的混合重排
                                 if (p_opts.m_rerank > 0 && p_opts.m_resultNum > 0) 
                                 {
                                     p_index->RerankFullVectorFusion(p_results[index], rerankVectorSet, i, &(p_stats[index]));
                                 }
                             }else{
+                                // 标准重排序：用原始向量精确计算 top 候选的距离
                                 if (p_opts.m_rerank > 0 && p_opts.m_resultNum > 0) 
                                 {
                                     p_index->RerankFullVector(p_results[index], rerankVectorSet, i, postingIDSet, &(p_stats[index]));
@@ -205,6 +218,7 @@ namespace SPTAG
                             }
                             */
                             
+                            // -------- 阶段 D：统计延时信息 --------
                             double exEndTime = threadws.getElapsedMs();
 
                             p_stats[index].m_exLatency = searchEndTime - endTime;
@@ -214,10 +228,12 @@ namespace SPTAG
                         }
                         else
                         {
-                            return;
+                            return; // 所有查询处理完毕，线程退出
                         }
                     } });
                 }
+
+                // ========== 3. 等待所有线程结束 ==========
                 for (auto &thread : threads)
                 {
                     thread.join();
@@ -234,12 +250,14 @@ namespace SPTAG
                 //              static_cast<uint32_t>(numQueries));
                 // }
 
+                // 输出整体 QPS
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
                         "Finish sending in %.3lf seconds, actuallQPS is %.2lf, query count %u.\n",
                         sendingCost,
                         numQueries / sendingCost,
                         static_cast<uint32_t>(numQueries));
-
+                    
+                // ========== 4. 清理量化目标，释放可能的内存 ==========
                 for (int i = 0; i < numQueries; i++)
                 {
                     p_results[i].CleanQuantizedTarget();
@@ -270,7 +288,7 @@ namespace SPTAG
                 }
                 int numThreads = p_opts.m_iSSDNumberOfThreads;
                 int internalResultNum = p_opts.m_searchInternalResultNum;
-                int K = p_opts.m_resultNum;
+                int K = p_opts.m_resultNum; // topK
                 int truthK = (p_opts.m_rerank <= 0) ? K : p_opts.m_rerank;
 
                 std::string QuantizervectorFilePath = p_opts.m_quantizerVectorFilePath;
@@ -283,8 +301,8 @@ namespace SPTAG
                 }
                 ptr_vector->ReadBinary(sizeof(count), reinterpret_cast<char *>(&(count)));
                 ptr_vector->ReadBinary(sizeof(dim), reinterpret_cast<char *>(&(dim)));
-                std::shared_ptr<VectorSet> PQVectorSet;
-                void *d_PQVectorSet;
+                std::shared_ptr<VectorSet> QuantizedVectorSet;
+                void *d_QuantizedVectorSet;    // d_表示device，GPU端通常称为device，CPU端通常称为host
                 if (!QuantizervectorFilePath.empty() && fileexists(QuantizervectorFilePath.c_str()))
                 {
                     std::shared_ptr<Helper::ReaderOptions> vectorOptions(new Helper::ReaderOptions(VectorValueType::UInt8, dim, p_opts.m_vectorType, p_opts.m_vectorDelimiter));
@@ -292,17 +310,17 @@ namespace SPTAG
                     if (ErrorCode::Success == vectorReader->LoadFile(QuantizervectorFilePath))
                     {
                         // 打印Load Vector(1000000000,32)
-                        PQVectorSet = vectorReader->GetVectorSet();
+                        QuantizedVectorSet = vectorReader->GetVectorSet();
                     }
                 }
 
                 if(p_opts.m_enableGPU)
                 {
-                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Load PQVectorSet to GPU\n");
-                    cudaMalloc((void **)&d_PQVectorSet, sizeof(uint8_t) * PQVectorSet->Count() * PQVectorSet->Dimension());
-                    cudaMemcpy(d_PQVectorSet, PQVectorSet->GetData(), sizeof(uint8_t) * PQVectorSet->Count() * PQVectorSet->Dimension(), cudaMemcpyHostToDevice);
-                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Load PQVectorSet Finish\n");
-                    PQVectorSet.reset();
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Load QuantizedVectorSet to GPU\n");
+                    cudaMalloc((void **)&d_QuantizedVectorSet, sizeof(uint8_t) * QuantizedVectorSet->Count() * QuantizedVectorSet->Dimension());
+                    cudaMemcpy(d_QuantizedVectorSet, QuantizedVectorSet->GetData(), sizeof(uint8_t) * QuantizedVectorSet->Count() * QuantizedVectorSet->Dimension(), cudaMemcpyHostToDevice);
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Load QuantizedVectorSet Finish\n");
+                    QuantizedVectorSet.reset();
                 }
 
                 std::string PostingListFilePath = p_opts.m_indexDirectory + FolderSep + p_opts.m_postingListIndex;
@@ -315,16 +333,16 @@ namespace SPTAG
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to read quantizervector file.\n");
                     return;
                 }
-                SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Beign load PQpostinglist\n");
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Beign load postinglist\n");
                 if (fp_read->ReadBinary(sizeof(int), reinterpret_cast<char *>(&(num_postinglist))) != sizeof(int))
                 {
-                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to read PQPostingList file!\n");
-                    throw std::runtime_error("Failed read file in PQPostingList");
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to read PostingList file!\n");
+                    throw std::runtime_error("Failed read file in PostingList");
                 }
                 if (fp_read->ReadBinary(sizeof(int), reinterpret_cast<char *>(&(fullVectorCount))) != sizeof(int))
                 {
-                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to read PQPostingList file!\n");
-                    throw std::runtime_error("Failed read file in PQPostingList");
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to read PostingList file!\n");
+                    throw std::runtime_error("Failed read file in PostingList");
                 }
 
                 for (int i = 0; i < num_postinglist; i++)
@@ -332,8 +350,8 @@ namespace SPTAG
                     int postingListMeta;
                     if (fp_read->ReadBinary(sizeof(int), reinterpret_cast<char *>(&(postingListMeta))) != sizeof(int))
                     {
-                        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to read PQPostingList file!\n");
-                        throw std::runtime_error("Failed read file in PQPostingList");
+                        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to read PostingList file!\n");
+                        throw std::runtime_error("Failed read file in PostingList");
                     }
                     numvec.push_back(postingListMeta);
                     if (postingListMeta > MaxNumVec)  MaxNumVec = postingListMeta;
@@ -345,11 +363,11 @@ namespace SPTAG
                     postinglist.push_back(std::unique_ptr<int[]>(new int[numvec[i]]));
                     if (fp_read->ReadBinary(sizeof(int) * numvec[i], reinterpret_cast<char *>(postinglist[i].get())) != sizeof(int) * numvec[i])
                     {
-                        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to read PQPostingList file!\n");
-                        throw std::runtime_error("Failed read file in PQPostingList");
+                        SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to read PostingList file!\n");
+                        throw std::runtime_error("Failed read file in PostingList");
                     }
                 }
-                SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Load PQpostinglist finish\n");
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Load postinglist finish\n");
 
                 std::shared_ptr<VectorSet> vectorSetRatio;
                 if (!p_opts.m_vectorPath.empty() && fileexists(p_opts.m_vectorPath.c_str()))
@@ -372,20 +390,22 @@ namespace SPTAG
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "Failed to read quantizer file.\n");
                     return;
                 }
+                // 此处原来调用了PQQuantizer::LoadQuantizer，打印了Loading Quantizer.到Loading quantizer:中间一堆信息
+                // 现在改为RaBitQ
                 quantizer = SPTAG::COMMON::IQuantizer::LoadIQuantizer(ptr);
                 quantizer->SetEnableADC(true);
 
                 int totalNumVec = MaxNumVec * p_opts.m_searchInternalResultNum;
-                uint8_t *d_table;
+                uint8_t *d_table;   // 存放每个查询的 ADC 查表（float），分块长度是 256（centroids）× PQ 子维数
                 cudaMalloc((void **)&d_table, 256 * dim * sizeof(float) * numThreads);
 
-                int *d_vectorIDs;
+                int *d_vectorIDs;   // 端存放本次要计算的向量 ID 列表（int），由 host 填充后传入 kernel
                 cudaMalloc((void **)&d_vectorIDs, sizeof(int) * totalNumVec * numThreads);
 
-                float *d_dist;
+                float *d_dist;  // device 端的距离结果数组（float），kernel 对每个向量累加到这里，之后拷回 host
                 cudaMalloc((void **)&d_dist, sizeof(float) * totalNumVec * numThreads);
 
-                float *h_dist;
+                float *h_dist;  // 用 cudaMallocHost 分配的锁页（pinned）主机内存，用于高效地从 device 拷贝回距离结果并供 CPU 读取
                 cudaMallocHost((void **)&h_dist, sizeof(float) * totalNumVec * numThreads);
 
                 bool isWarmup = false;
@@ -401,7 +421,7 @@ namespace SPTAG
                         exit(1);
                     }
                     auto warmupQuerySet = queryReader->GetVectorSet();
-                    int warmupNumQueries = warmupQuerySet->Count();
+                    int warmupNumQueries = warmupQuerySet->Count(); // warmup集的查询数量
 
                     std::vector<QueryResult> warmupResults(warmupNumQueries, QueryResult(NULL, max(K, internalResultNum), false));
                     std::vector<SPANN::SearchStats> warmpUpStats(warmupNumQueries);
@@ -414,8 +434,8 @@ namespace SPTAG
 
                     isWarmup = true;
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Start warmup...\n");
-                    SearchSequential(p_index, numThreads, warmupResults, warmpUpStats, p_opts.m_queryCountLimit, internalResultNum, warmupQuerySet, PQVectorSet,
-                    vectorSetRatio, count, dim, numvec, postinglist, d_PQVectorSet, d_table, d_vectorIDs, d_dist, h_dist, totalNumVec, quantizer, isWarmup);
+                    SearchSequential(p_index, numThreads, warmupResults, warmpUpStats, p_opts.m_queryCountLimit, internalResultNum, warmupQuerySet, QuantizedVectorSet,
+                    vectorSetRatio, count, dim, numvec, postinglist, d_QuantizedVectorSet, d_table, d_vectorIDs, d_dist, h_dist, totalNumVec, quantizer, isWarmup);
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "\nFinish warmup...\n");
                     isWarmup = false;
                 }
@@ -443,8 +463,8 @@ namespace SPTAG
 
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Start ANN Search...\n");
 
-                SearchSequential(p_index, numThreads, results, stats, p_opts.m_queryCountLimit, internalResultNum, querySet, PQVectorSet,
-                vectorSetRatio, count, dim, numvec, postinglist, d_PQVectorSet, d_table, d_vectorIDs, d_dist, h_dist, totalNumVec, quantizer, isWarmup);
+                SearchSequential(p_index, numThreads, results, stats, p_opts.m_queryCountLimit, internalResultNum, querySet, QuantizedVectorSet,
+                vectorSetRatio, count, dim, numvec, postinglist, d_QuantizedVectorSet, d_table, d_vectorIDs, d_dist, h_dist, totalNumVec, quantizer, isWarmup);
 
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "\nFinish ANN Search...\n");
                 

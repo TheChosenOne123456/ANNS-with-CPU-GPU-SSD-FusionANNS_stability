@@ -429,6 +429,7 @@ namespace SPTAG
             // 从磁盘流加载量化器配置
             virtual ErrorCode LoadQuantizer(std::shared_ptr<Helper::DiskIO> p_in)
             {
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Loading RaBitQQuantizer.\n");
                 std::uint32_t version = 0;
                 IOBINARY(p_in, ReadBinary, sizeof(std::uint32_t), (char*)&version);
 
@@ -449,19 +450,25 @@ namespace SPTAG
                 if (version != static_cast<std::uint32_t>(PersistVersion::V2)) return ErrorCode::Fail;
 
                 IOBINARY(p_in, ReadBinary, sizeof(DimensionType), (char*)&m_Dim);
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "After read dim: %s.\n", std::to_string(m_Dim).c_str());
                 IOBINARY(p_in, ReadBinary, sizeof(DimensionType), (char*)&m_PaddedDim);
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "After read PaddedDim: %s.\n", std::to_string(m_PaddedDim).c_str());
                 IOBINARY(p_in, ReadBinary, sizeof(SizeType), (char*)&m_BitsPerCode);
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "After read BitsPerCode: %s.\n", std::to_string(m_BitsPerCode).c_str());
 
                 std::uint8_t rotType = 0;
                 IOBINARY(p_in, ReadBinary, sizeof(std::uint8_t), (char*)&rotType);
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "After read rotType: %s.\n", std::to_string(rotType).c_str());
                 m_RotatorType = static_cast<RotatorStorageType>(rotType);
 
                 std::uint32_t magic = 0;
                 IOBINARY(p_in, ReadBinary, sizeof(std::uint32_t), (char*)&magic);
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "After read magic: %s.\n", std::to_string(magic).c_str());
                 if (magic != 0x52425451) return ErrorCode::Fail;
 
-                std::uint64_t blobBytes = 0;
+                std::uint64_t blobBytes = 0;    // 序列化的旋转器（Rotator）对象的二进制字节数，用于保存和恢复 RaBitQ 量化所依赖的正交随机旋转矩阵。
                 IOBINARY(p_in, ReadBinary, sizeof(std::uint64_t), (char*)&blobBytes);
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "After read blobBytes: %s.\n", std::to_string(blobBytes).c_str());
 
                 std::vector<std::uint8_t> rotBlob(blobBytes);
                 if (blobBytes > 0) {
@@ -472,6 +479,7 @@ namespace SPTAG
                 if (ErrorCode::Success != DeserializeRotator(rotBlob)) return ErrorCode::Fail;
 
                 RecalcSizes();
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Loading RaBitQQuantizer finished.\n");
                 return ErrorCode::Success;
             }
 

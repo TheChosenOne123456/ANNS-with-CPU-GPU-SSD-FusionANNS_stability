@@ -93,6 +93,7 @@ namespace SPTAG {
 			}
 
 
+			// 输出从此开始
 			SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Set QuantizerFile = %s\n", QuantizerFilePath.c_str());
 
 			// 外层索引是 SPANN，不是 BKT
