@@ -902,7 +902,8 @@ namespace SPTAG
                 dim, 
                 bits_per_code,      // RaBitQ 专属参数：告知核函数步长
                 numVector, 
-                limitDist           // 引入 limitDist 到内侧做 Pruning
+                // limitDist           // 引入 limitDist 到内侧做 Pruning
+                1e30f                // 关闭 GPU 侧剪枝
             );
 
             float *h_dist_temp = h_dist + totalNumVec * threadOrder;
@@ -911,6 +912,20 @@ namespace SPTAG
             // ==========================================
             // 板块 5：距离绑定与最终排序
             // ==========================================
+
+            // 测试
+            if (threadOrder == 0 && numVector > 10) {
+                 static std::atomic<int> printCount{0};
+                 if (printCount.fetch_add(1) < 2) { // 全局只打印前两次 Query 的调试信息，防刷屏
+                     SPTAGLIB_LOG(Helper::LogLevel::LL_Info, 
+                         "TEST GPU OUT [Q%d]: limitDist=%f, bond_meta(g_add=%f, error=%f)\n", 
+                         printCount.load(), limitDist, bond_meta_gpu.g_add, bond_meta_gpu.g_error);
+                     SPTAGLIB_LOG(Helper::LogLevel::LL_Info, 
+                         "TEST H_DIST_TEMP: ID[0]:%d -> Dist:%f, ID[1]:%d -> Dist:%f, ID[2]:%d -> Dist:%f\n",
+                         vectorIDs[0], h_dist_temp[0], vectorIDs[1], h_dist_temp[1], vectorIDs[2], h_dist_temp[2]);
+                 }
+            } 
+
             for (int i = 0; i < numVector; i++)
             {
                 // 核心剪枝验证：GPU 端的 ProcessRaBitQ 若检测到 lowerBound > limitDist, 
@@ -933,6 +948,8 @@ namespace SPTAG
         template <typename T>
         ErrorCode Index<T>::RerankFullVector(QueryResult &p_query, std::shared_ptr<VectorSet> vectorSet, int threadOrder, std::unordered_set<int>& postingIDSet, SearchStats* p_stats) const
         {
+            // 测试  
+            // std::cout << "TEST : RerankFullVector is called." << std::endl;
             COMMON::QueryResultSet<T> *queryResults = (COMMON::QueryResultSet<T> *)&p_query;
             const T* targetVector = reinterpret_cast<const T *>(queryResults->GetTarget());
 
@@ -1164,6 +1181,8 @@ namespace SPTAG
         template <typename T>
         ErrorCode Index<T>::RerankFullVectorFusion(QueryResult &p_query, std::shared_ptr<VectorSet> vectorSet, int threadOrder, SearchStats* p_stats) const
         {
+            // 测试
+            // std::cout << "TEST : RerankFullVectorFusion is called." << std::endl;
             COMMON::QueryResultSet<T> *queryResults = (COMMON::QueryResultSet<T> *)&p_query;
             const T* targetVector = reinterpret_cast<const T *>(queryResults->GetTarget());
             std::unordered_map<int64_t, Helper::AsyncReadRequest> uniqueRequests;

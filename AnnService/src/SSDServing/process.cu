@@ -332,6 +332,9 @@ void computeRaBitQDistanceWithGPU(
     int block = 256; 
     int grid = (count + block - 1) / block;
 
+    // 清空上次可能的错误
+    cudaGetLastError(); 
+
     ProcessRaBitQ<<<grid, block>>>(
         d_QuantizedVectorSet, 
         d_vectorIDs, 
@@ -344,5 +347,10 @@ void computeRaBitQDistanceWithGPU(
         limitDist
     );
 
-    cudaDeviceSynchronize();
+    // 同步并捕获 Kernel 自身崩溃的异常
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        // printf("CUDA KERNEL KILLED! Error: %s\n", cudaGetErrorString(err));
+    }
+    // cudaDeviceSynchronize();
 }

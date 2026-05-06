@@ -328,6 +328,9 @@ namespace SPTAG
                                 }
 
                                 // -------- 阶段 A：内存 head 索引搜索（粗排）--------
+                                // 测试
+                                if((index & ((1 << 14) - 1)) == 0)
+                                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "TEST : A search head\n");
                                 double startTime = threadws.getElapsedMs();
                                 p_index->GetMemoryIndex()->SearchIndex(p_results[index]);
                                 double endTime = threadws.getElapsedMs();
@@ -345,6 +348,9 @@ namespace SPTAG
                                 std::unordered_set<int> postingIDSet;   // 记录访问过的向量 ID
 
                                 // -------- 阶段 B：量化倒排查找（细排，采用 RaBitQ 专属策略）--------
+                                // 测试
+                                if((index & ((1 << 14) - 1)) == 0)
+                                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "TEST : B RaBitQ+GPU search\n");
                                 if(p_opts.m_enableGPU)
                                 {
                                     // 1. 将当前查询算好的 rotated_query 发往 GPU。
@@ -381,17 +387,23 @@ namespace SPTAG
                                 double searchEndTime = threadws.getElapsedMs();
 
                                 // -------- 阶段 C：重排序（rerank，读 SSD）--------
+                                // 测试
+                                if((index & ((1 << 14) - 1)) == 0)
+                                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "TEST : C m_rerank = %d, m_resultNum = %d\n", p_opts.m_rerank, p_opts.m_resultNum);
                                 if (p_opts.m_enableReorderIndex) {
                                     if (p_opts.m_rerank > 0 && p_opts.m_resultNum > 0) {
                                         p_index->RerankFullVectorFusion(p_results[index], rerankVectorSet, i, &(p_stats[index]));
                                     }
                                 } else {
                                     if (p_opts.m_rerank > 0 && p_opts.m_resultNum > 0) {
-                                        p_index->RerankFullVector(p_results[index], rerankVectorSet, i, postingIDSet, &(p_stats[index]));
+                                        // p_index->RerankFullVector(p_results[index], rerankVectorSet, i, postingIDSet, &(p_stats[index]));
                                     }
                                 }
                                 
                                 // -------- 阶段 D：统计延时信息 --------
+                                // 测试
+                                if((index & ((1 << 14) - 1)) == 0)
+                                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "TEST : D delay info\n");
                                 double exEndTime = threadws.getElapsedMs();
                                 p_stats[index].m_exLatency = searchEndTime - endTime;
                                 p_stats[index].m_totalSearchLatency = searchEndTime - startTime;
@@ -459,13 +471,16 @@ namespace SPTAG
                 ptr_vector->ReadBinary(sizeof(dim), reinterpret_cast<char *>(&(dim)));
                 std::shared_ptr<VectorSet> QuantizedVectorSet;
                 void *d_QuantizedVectorSet;    // d_表示device，GPU端通常称为device，CPU端通常称为host
+                // std::cout << "TEST : begin loading quantized vector" << std::endl;
                 if (!QuantizervectorFilePath.empty() && fileexists(QuantizervectorFilePath.c_str()))
                 {
                     std::shared_ptr<Helper::ReaderOptions> vectorOptions(new Helper::ReaderOptions(VectorValueType::UInt8, dim, p_opts.m_vectorType, p_opts.m_vectorDelimiter));
                     auto vectorReader = Helper::VectorSetReader::CreateInstance(vectorOptions);
+                    // std::cout << "1" << std::endl;
                     if (ErrorCode::Success == vectorReader->LoadFile(QuantizervectorFilePath))
                     {
                         // 打印Load Vector(1000000000,32)
+                        // std::cout << "2" << std::endl;
                         QuantizedVectorSet = vectorReader->GetVectorSet();
                     }
                 }
@@ -474,6 +489,8 @@ namespace SPTAG
                 {
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Load QuantizedVectorSet to GPU\n");
                     cudaMalloc((void **)&d_QuantizedVectorSet, sizeof(uint8_t) * QuantizedVectorSet->Count() * QuantizedVectorSet->Dimension());
+                    // 测试
+                    std::cout << "TEST : Dimension = " << QuantizedVectorSet->Dimension() << ", Count = " << QuantizedVectorSet->Count() << std::endl;
                     cudaMemcpy(d_QuantizedVectorSet, QuantizedVectorSet->GetData(), sizeof(uint8_t) * QuantizedVectorSet->Count() * QuantizedVectorSet->Dimension(), cudaMemcpyHostToDevice);
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Load QuantizedVectorSet Finish\n");
                     QuantizedVectorSet.reset();

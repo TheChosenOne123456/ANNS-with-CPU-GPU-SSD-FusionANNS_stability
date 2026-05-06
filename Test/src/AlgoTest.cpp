@@ -633,7 +633,7 @@ BOOST_AUTO_TEST_CASE(RaBitQ_vs_Uint8_Kernel_Benchmark)
     BOOST_REQUIRE(rabitq != nullptr);
 
     // 指定量化bit数
-    int bits_per_code = 4;
+    int bits_per_code = 1;
     rabitq->SetBitsPerCode(bits_per_code);
     std::cout << "BitsPerCode=" << bits_per_code << std::endl;
     rabitq->Train(data.data(), n);
