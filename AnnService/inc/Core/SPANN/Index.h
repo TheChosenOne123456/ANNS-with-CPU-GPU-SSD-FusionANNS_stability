@@ -152,6 +152,24 @@ namespace SPTAG
             ErrorCode SearchPQIndex_CPU(QueryResult& p_query,std::shared_ptr<VectorSet> vectorSet, int PQVectorsCount, int PQVectorDim, std::vector<int>& numVecPerPostinglist, std::vector<std::unique_ptr<int[]>>& postinglist, std::unordered_set<int>& postingIDSet, SearchStats* p_stats = nullptr) const;
             ErrorCode SearchPQIndex_with_GPU(QueryResult& p_query,std::shared_ptr<VectorSet> vectorSet, int PQVectorsCount, int PQVectorDim, std::vector<int>& numVecPerPostinglist, std::vector<std::unique_ptr<int[]>>& postinglist, void* d_PQVectorSet, SearchStats* p_stats = nullptr) const;
             ErrorCode SearchPQIndex_GPU(QueryResult& p_query, int PQVectorsCount, int PQVectorDim, std::vector<int>& numVecPerPostinglist, std::vector<std::unique_ptr<int[]>>& postinglist, void* d_PQVectorSet, uint8_t *d_table, int* d_vectorIDs, float *d_dist, float *h_dist, int totalNumVec, int threadOrder, std::unordered_set<int>& postingIDSet, SearchStats* p_stats = nullptr) const;
+            ErrorCode SearchRaBitQIndex_GPU(
+                QueryResult& p_query, 
+                int dim, 
+                int bits_per_code, 
+                std::vector<int>& numVecPerPostinglist, 
+                std::vector<std::unique_ptr<int[]>>& postinglist, 
+                void* d_QuantizedVectorSet, 
+                float* d_rotated_query,         
+                float g_add,     // bond_meta
+                float k1xsumq,  // bond_meta
+                float g_error,  // bond_meta
+                int* d_vectorIDs, 
+                float* d_dist, 
+                float* h_dist, 
+                int totalNumVec, 
+                int threadOrder, 
+                std::unordered_set<int>& postingIDSet, 
+                SearchStats* p_stats) const;
             ErrorCode RerankFullVector(QueryResult &p_query, std::shared_ptr<VectorSet> vectorSet, int threadOrder, std::unordered_set<int>& postingIDSet, SearchStats* p_stats = nullptr) const;
             ErrorCode RerankFullVectorFusion(QueryResult &p_query, std::shared_ptr<VectorSet> vectorSet, int threadOrder, SearchStats* p_stats = nullptr) const;
             float L2Distance(const std::uint8_t* pX, const std::uint8_t* pY, int dimVectors) const;

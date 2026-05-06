@@ -20,6 +20,10 @@ namespace SPTAG
 
             virtual float CosineDistance(const std::uint8_t* pX, const std::uint8_t* pY) const = 0;
 
+            virtual void PreprocessQuery(const void* in_query, float* out_rotated) const {}
+            virtual float L2Distance(const float* rotated_query, const std::uint8_t* pY) const { return 0.0f; }
+            virtual float L2Distance(const float* rotated_query, const std::uint8_t* pY, const void* bond_meta, float* out_low_dist = nullptr) const { return 0.0f; }
+
             template <typename T>
             std::function<float(const T*, const T*, SizeType)> DistanceCalcSelector(SPTAG::DistCalcMethod p_method) const;
 

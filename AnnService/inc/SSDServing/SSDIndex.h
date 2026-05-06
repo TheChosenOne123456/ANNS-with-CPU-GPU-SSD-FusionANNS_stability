@@ -14,6 +14,7 @@
 #include "inc/Helper/StringConvert.h"
 #include "inc/SSDServing/Utils.h"
 #include "cuda_runtime.h"
+#include "inc/Core/Common/RaBitQQuantizer.h"
 
 namespace SPTAG
 {
@@ -158,8 +159,14 @@ namespace SPTAG
                             p_index->GetMemoryIndex()->SearchIndex(p_results[index]);
                             double endTime = threadws.getElapsedMs();
 
+                            // QueryResult 是贯穿整个检索流程的核心上下文数据结构。它同时包含两方面的信息：
+                            // Target（查询自身的信息）：它存储了当前这通 Query 的原始特征向量。
+                            // Results（Top-K 中间/最终结果列表）：它维护了一个优先队列（Heap），里面存的是当前搜索出来的候选点的 ID (VID) 和距离 (Dist)
+
                             // 设置新 PQ 目标，供后续量化距离计算使用
-                            (*((COMMON::QueryResultSet<ValueType> *)&p_results[index])).Setmy_newPQTarget(quantizer);
+                            if(quantizer->GetQuantizerType() == QuantizerType::PQQuantizer){
+                                (*((COMMON::QueryResultSet<ValueType> *)&p_results[index])).Setmy_newPQTarget(quantizer);
+                            }
                             std::unordered_set<int> postingIDSet;   // 记录访问过的向量 ID（可能用于去重等）
                             
                             // -------- 阶段 B：量化倒排查找（细排，含 SSD 读取）--------
@@ -262,6 +269,155 @@ namespace SPTAG
                 {
                     p_results[i].CleanQuantizedTarget();
                 }
+            }
+
+            template <typename ValueType>
+            void SearchSequentialRaBitQVersion(
+                SPANN::Index<ValueType>* p_index,
+                int p_numThreads,
+                std::vector<QueryResult>& p_results,    // 存internalResultNum 个最近的聚类中心
+                std::vector<SPANN::SearchStats>& p_stats,
+                int p_maxQueryCount, 
+                int p_internalResultNum,
+                std::shared_ptr<SPTAG::VectorSet> querySet,
+                std::shared_ptr<SPTAG::VectorSet> QuantizedVectorSet, // 存放量化倒排链的主数据结构
+                std::shared_ptr<SPTAG::VectorSet> rerankVectorSet,
+                int dim, 
+                int bits_per_code,
+                std::vector<int>& numVecPerPostinglist, 
+                std::vector<std::unique_ptr<int[]>>& postinglist, 
+                void* d_QuantizedVectorSet,
+                float *d_rotated_query,     // GPU上存放的每条查询单独的 rotated_query，替换掉了 d_table
+                int* d_vectorIDs, 
+                float *d_dist, 
+                float *h_dist, 
+                int totalNumVec, 
+                std::shared_ptr<SPTAG::COMMON::RaBitQQuantizer<ValueType>> quantizer, 
+                bool isWarmup)
+            {
+                // ========== 1. 初始化查询数量与线程 ==========
+                int numQueries = min(static_cast<int>(p_results.size()), p_maxQueryCount);
+                std::atomic_size_t queriesSent(0);
+                std::vector<std::thread> threads;
+                threads.reserve(p_numThreads);
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Searching (RaBitQ Version): numThread: %d, numQueries: %d.\n", p_numThreads, numQueries);
+
+                SPANN::Options &p_opts = *(p_index->GetOptions());
+                // 提前拿到 padding 后的维数，方便做批处理和显存拷贝
+                int paddedDim = quantizer->GetPaddedDim();
+
+                // ========== 2. 启动多个工作线程，每个线程不断取查询处理 ==========
+                Utils::StopW sw;    // 用于统计整体发送耗时
+                for (int i = 0; i < p_numThreads; i++)
+                {
+                    threads.emplace_back([&, i]()
+                    {
+                        NumaStrategy ns = (p_index->GetDiskIndex() != nullptr) ? NumaStrategy::SCATTER : NumaStrategy::LOCAL; 
+                        Helper::SetThreadAffinity(i, threads[i], ns, OrderStrategy::ASC); 
+
+                        Utils::StopW threadws;  // 单个查询的计时器
+                        size_t index = 0;
+                        while (true)
+                        {
+                            // 原子获取下一个查询的编号
+                            index = queriesSent.fetch_add(1);
+                            if (index < numQueries)
+                            {
+                                if ((index & ((1 << 14) - 1)) == 0) {
+                                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Sent %.2lf%%...\n", index * 100.0 / numQueries);
+                                }
+
+                                // -------- 阶段 A：内存 head 索引搜索（粗排）--------
+                                double startTime = threadws.getElapsedMs();
+                                p_index->GetMemoryIndex()->SearchIndex(p_results[index]);
+                                double endTime = threadws.getElapsedMs();
+
+                                // 我们不在 QueryResultSet 中缓存庞大的 LookUpTable，
+                                // 这里我们自己当场通过 RaBitQQuantizer 算出 rotated_query 和 meta。
+                                const ValueType* target = reinterpret_cast<const ValueType*>(p_results[index].GetTarget());
+
+                                std::vector<float> rotated_query(paddedDim, 0.0f);
+                                
+                                quantizer->PreprocessQuery(target, rotated_query.data());
+                                typename COMMON::RaBitQQuantizer<ValueType>::BondMeta bond_meta;
+                                quantizer->BuildL2EstimateQueryFactors(rotated_query.data(), bond_meta);
+
+                                std::unordered_set<int> postingIDSet;   // 记录访问过的向量 ID
+
+                                // -------- 阶段 B：量化倒排查找（细排，采用 RaBitQ 专属策略）--------
+                                if(p_opts.m_enableGPU)
+                                {
+                                    // 1. 将当前查询算好的 rotated_query 发往 GPU。
+                                    // 每个线程通过 threadOrder(`i`) 独占一块 `actualPaddedDim` 长度的显存，互不干扰
+                                    float* current_gpu_query = d_rotated_query + i * paddedDim;
+                                    cudaMemcpy(current_gpu_query, rotated_query.data(), paddedDim * sizeof(float), cudaMemcpyHostToDevice);
+
+                                    // 2. 调用我们在 SPANNIndex.cpp 写的 SearchRaBitQIndex_GPU 分支
+                                    p_index->SearchRaBitQIndex_GPU(
+                                        p_results[index], 
+                                        dim, 
+                                        bits_per_code, 
+                                        numVecPerPostinglist, 
+                                        postinglist, 
+                                        d_QuantizedVectorSet, 
+                                        current_gpu_query,      // 纯净的指针
+                                        bond_meta.g_add,        // 【修改】：拆成三个 float 传入
+                                        bond_meta.k1xsumq,
+                                        bond_meta.g_error,
+                                        d_vectorIDs, 
+                                        d_dist, 
+                                        h_dist, 
+                                        totalNumVec, 
+                                        i,                      // threadOrder
+                                        postingIDSet, 
+                                        &(p_stats[index])
+                                    );
+                                }
+                                else
+                                {
+                                    // TODO: 如果你需要支持 CPU，可以在这里补充一个 SearchRaBitQIndex_CPU 调用。
+                                }
+                                
+                                double searchEndTime = threadws.getElapsedMs();
+
+                                // -------- 阶段 C：重排序（rerank，读 SSD）--------
+                                if (p_opts.m_enableReorderIndex) {
+                                    if (p_opts.m_rerank > 0 && p_opts.m_resultNum > 0) {
+                                        p_index->RerankFullVectorFusion(p_results[index], rerankVectorSet, i, &(p_stats[index]));
+                                    }
+                                } else {
+                                    if (p_opts.m_rerank > 0 && p_opts.m_resultNum > 0) {
+                                        p_index->RerankFullVector(p_results[index], rerankVectorSet, i, postingIDSet, &(p_stats[index]));
+                                    }
+                                }
+                                
+                                // -------- 阶段 D：统计延时信息 --------
+                                double exEndTime = threadws.getElapsedMs();
+                                p_stats[index].m_exLatency = searchEndTime - endTime;
+                                p_stats[index].m_totalSearchLatency = searchEndTime - startTime;
+                                p_stats[index].rerankLatency = exEndTime - searchEndTime;
+                                p_stats[index].m_totalLatency = exEndTime - startTime;
+                            }
+                            else
+                            {
+                                return; // 所有查询处理完毕，线程退出
+                            }
+                        } 
+                    });
+                }
+
+                // ========== 3. 等待所有线程结束 ==========
+                for (auto &thread : threads)
+                {
+                    thread.join();
+                }
+
+                double sendingCost = sw.getElapsedSec();
+                SPTAGLIB_LOG(Helper::LogLevel::LL_Info,
+                        "Finish sending in %.3lf seconds, actuallQPS is %.2lf, query count %u.\n",
+                        sendingCost,
+                        numQueries / sendingCost,
+                        static_cast<uint32_t>(numQueries));
             }
 
             template <typename ValueType>
@@ -396,8 +552,26 @@ namespace SPTAG
                 quantizer->SetEnableADC(true);
 
                 int totalNumVec = MaxNumVec * p_opts.m_searchInternalResultNum;
-                uint8_t *d_table;   // 存放每个查询的 ADC 查表（float），分块长度是 256（centroids）× PQ 子维数
-                cudaMalloc((void **)&d_table, 256 * dim * sizeof(float) * numThreads);
+                
+                // 根据量化器类型分别声明不同用途的 GPU 内存指针
+                uint8_t *d_table = nullptr; 
+                float *d_rotated_query = nullptr; 
+                std::shared_ptr<SPTAG::COMMON::RaBitQQuantizer<ValueType>> rabitq_quantizer = nullptr;
+
+                // --- 核心改动：直接通过 == 判断类型并分配由于算法不同导致所需的不同显存 ---
+                if (quantizer->GetQuantizerType() == QuantizerType::RaBitQQuantizer)
+                {
+                    rabitq_quantizer = std::dynamic_pointer_cast<SPTAG::COMMON::RaBitQQuantizer<ValueType>>(quantizer);
+                    int paddedDim = rabitq_quantizer->GetPaddedDim(); // 使用你新加的 public 接口
+                    
+                    // RaBitQ 不需要查表，只需要每条线程存放其旋转和补齐后的查询向量
+                    cudaMalloc((void **)&d_rotated_query, sizeof(float) * paddedDim * numThreads);
+                }
+                else
+                {
+                    // 原始 PQ 模式：存放每个查询的 ADC 查表，分块长度是 256（centroids）× dim
+                    cudaMalloc((void **)&d_table, 256 * dim * sizeof(float) * numThreads);
+                }
 
                 int *d_vectorIDs;   // 端存放本次要计算的向量 ID 列表（int），由 host 填充后传入 kernel
                 cudaMalloc((void **)&d_vectorIDs, sizeof(int) * totalNumVec * numThreads);
@@ -434,8 +608,16 @@ namespace SPTAG
 
                     isWarmup = true;
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Start warmup...\n");
-                    SearchSequential(p_index, numThreads, warmupResults, warmpUpStats, p_opts.m_queryCountLimit, internalResultNum, warmupQuerySet, QuantizedVectorSet,
-                    vectorSetRatio, count, dim, numvec, postinglist, d_QuantizedVectorSet, d_table, d_vectorIDs, d_dist, h_dist, totalNumVec, quantizer, isWarmup);
+                    if (quantizer->GetQuantizerType() == QuantizerType::RaBitQQuantizer) 
+                    {
+                        SearchSequentialRaBitQVersion(p_index, numThreads, warmupResults, warmpUpStats, p_opts.m_queryCountLimit, internalResultNum, warmupQuerySet, QuantizedVectorSet,
+                        vectorSetRatio, dim, rabitq_quantizer->GetBitsPerCode(), numvec, postinglist, d_QuantizedVectorSet, d_rotated_query, d_vectorIDs, d_dist, h_dist, totalNumVec, rabitq_quantizer, isWarmup);
+                    }
+                    else if (quantizer->GetQuantizerType() == QuantizerType::PQQuantizer)
+                    {
+                        SearchSequential(p_index, numThreads, warmupResults, warmpUpStats, p_opts.m_queryCountLimit, internalResultNum, warmupQuerySet, QuantizedVectorSet,
+                        vectorSetRatio, count, dim, numvec, postinglist, d_QuantizedVectorSet, d_table, d_vectorIDs, d_dist, h_dist, totalNumVec, quantizer, isWarmup);
+                    }
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "\nFinish warmup...\n");
                     isWarmup = false;
                 }
@@ -463,12 +645,25 @@ namespace SPTAG
 
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Start ANN Search...\n");
 
-                SearchSequential(p_index, numThreads, results, stats, p_opts.m_queryCountLimit, internalResultNum, querySet, QuantizedVectorSet,
-                vectorSetRatio, count, dim, numvec, postinglist, d_QuantizedVectorSet, d_table, d_vectorIDs, d_dist, h_dist, totalNumVec, quantizer, isWarmup);
+                if (rabitq_quantizer) 
+                {
+                    // 测试
+                    // std::cout << "Using RaBitQQuantizer for search" << std::endl;
+                    SearchSequentialRaBitQVersion(p_index, numThreads, results, stats, p_opts.m_queryCountLimit, internalResultNum, querySet, QuantizedVectorSet,
+                    vectorSetRatio, dim, rabitq_quantizer->GetBitsPerCode(), numvec, postinglist, d_QuantizedVectorSet, d_rotated_query, d_vectorIDs, d_dist, h_dist, totalNumVec, rabitq_quantizer, isWarmup);
+                }
+                else
+                {
+                    SearchSequential(p_index, numThreads, results, stats, p_opts.m_queryCountLimit, internalResultNum, querySet, QuantizedVectorSet,
+                    vectorSetRatio, count, dim, numvec, postinglist, d_QuantizedVectorSet, d_table, d_vectorIDs, d_dist, h_dist, totalNumVec, quantizer, isWarmup);
+                }
 
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "\nFinish ANN Search...\n");
                 
-                cudaFree(d_table);
+                // 释放显存
+                if (d_table != nullptr) cudaFree(d_table);
+                if (d_rotated_query != nullptr) cudaFree(d_rotated_query);
+
                 cudaFree(d_vectorIDs);
                 cudaFree(d_dist);
                 cudaFreeHost(h_dist);

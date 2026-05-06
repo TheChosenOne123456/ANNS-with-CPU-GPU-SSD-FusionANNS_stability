@@ -6,8 +6,6 @@
 #include "inc/Core/SPANN/ExtraFullGraphSearcher.h"
 #include "inc/SSDServing/process.h"
 
-// [New] 引入 RaBitQ 头文件
-#include "inc/Core/Common/RaBitQQuantizer.h"
 
 #include "cuda_runtime.h"
 
@@ -649,6 +647,9 @@ namespace SPTAG
         uint8_t *d_table, int* d_vectorIDs, float *d_dist, float *h_dist, int totalNumVec, int threadOrder, 
         std::unordered_set<int>& postingIDSet, SearchStats* p_stats) const
         {
+            // 板块 1：初始化与头部聚类动态剪枝
+            // 第一步，函数拿到 Head 树返回的初始聚类中心结果，对其进行过滤。
+            // 如果某个聚类中心本身离 Query 实在太远了（大于一个设定的倍数界限），就没必要去读取它背后的量化向量了。
             auto cutStartTime = std::chrono::high_resolution_clock::now();
             COMMON::QueryResultSet<T> *queryResults = (COMMON::QueryResultSet<T> *)&p_query;
 
@@ -656,19 +657,24 @@ namespace SPTAG
             COMMON::OptHashPosVector deduper;
             deduper.Init(m_options.m_maxCheck, m_options.m_hashExp);
 
-            // 鍓灊绛栫暐锛屾牴鎹畇earchInternalResultNum閬嶅巻queryResults, queryResults瀛樻斁postinglistid鍜宲ostinglist鍒皅uery鐨勮窛绂?
+            // 用于记录那些通过了距离校验，真正要被遍历的倒排链(Posting List) ID
             std::vector<SizeType> postingIDs;
-            float limitDist = queryResults->GetResult(0)->Dist * m_options.m_maxDistRatio; // 璁剧疆璺濈闄愬埗锛堟渶澶ц窛绂讳负鏈�杩戣川蹇冨埌鏌ヨ鍚戦噺璺濈鐨?8鍊嶏級
+            // 设定一个动态阈值：Top-1 聚类距离的 m_maxDistRatio 倍（比如 8 倍）
+            float limitDist = queryResults->GetResult(0)->Dist * m_options.m_maxDistRatio;
+            // 遍历 Head 检索出来的聚类结果
             int ii = 0;
-            for (; ii < m_options.m_searchInternalResultNum; ++ii) // 鍔ㄦ�佸壀鏋濈瓥鐣?
+            for (; ii < m_options.m_searchInternalResultNum; ++ii)
             {
                 auto res = queryResults->GetResult(ii);
+                // 如果聚类无效，或者当前聚类的距离远超门槛，直接抛弃剪枝
                 if (res->VID == -1 || (limitDist > 0.1 && res->Dist > limitDist))
                     break;
-                if (numVecPerPostinglist[res->VID] != 0) // 灏嗙鍚堟潯浠剁殑璐ㄥ績鍔犲叆鍒扮粨鏋滀腑
+                // 如果这个聚类倒排链里有向量，就把它的 ID 存入 postingIDs
+                if (numVecPerPostinglist[res->VID] != 0)
                 {
                     postingIDs.emplace_back(res->VID);
                 }
+                // 把局部的聚类VID 映射回全局真实的 ID
                 res->VID = static_cast<SizeType>((m_vectorTranslateMap.get())[res->VID]);
                 if (!m_options.m_enableReorderIndex)
                 {
@@ -680,6 +686,7 @@ namespace SPTAG
                     res->Dist = MaxDist;
                 }
             }
+            // 处理剩余head（如果有的话），虽然它们不参与剪枝，但也需要把VID映射回全局ID
             for (; ii < queryResults->GetResultNum(); ++ii)
             {
                 auto res = queryResults->GetResult(ii);
@@ -696,6 +703,9 @@ namespace SPTAG
                     res->Dist = MaxDist;
                 }
             }
+
+            // 板块 2：准备 GPU 的查表数据
+            // 升序改降序
             queryResults->Reverse();
             // queryResults->Reverse(max(m_options.m_resultNum, m_options.m_rerank));
             auto cutEndTime = std::chrono::high_resolution_clock::now();
@@ -703,14 +713,20 @@ namespace SPTAG
             double cutelapsedMilliseconds = cutelapsed.count();
             p_stats->cutTreeLatency = cutelapsedMilliseconds;
 
+            // postingListCount 表示刚才第一步保留下来的幸存倒排链个数
             const SizeType postingListCount = static_cast<SizeType>(postingIDs.size());
-            std::vector<SizeType> vectorIDs;
+            std::vector<SizeType> vectorIDs;    // 准备用来装平铺开的底层向量ID
 
+            // PQ查找表，待替换
             uint8_t *h_table = reinterpret_cast<uint8_t *>(queryResults->GetnewPQTarget());
             int tableBytes = 256 * PQVectorDim * sizeof(float);
             uint8_t *table_temp = d_table + sizeof(uint8_t) * tableBytes * threadOrder;
+            // 当前Query的距离表从CPU拷贝到GPU
             cudaMemcpy(table_temp, h_table, tableBytes, cudaMemcpyHostToDevice);
 
+            // 板块 3：抽取底层候选向量ID池
+            // CPU 把刚刚选中的那些幸存倒排链统统遍历一遍，把里面包含的所有基础向量ID提出来，
+            // 压平放进一个名叫 vectorIDs 的大数组里
             for (int pi = 1; pi <= postingListCount; ++pi)
             {
 
@@ -742,19 +758,172 @@ namespace SPTAG
             //     }
             // }          
 
+            // 本次需要在 GPU 里算距离的总向量个数
             int numVector = vectorIDs.size();
             // std::cout<<"numVector is: "<<numVector<<std::endl;
+
+            // 板块 4：向 GPU 下发显存交互及核函数运算
             int *vectorID_temp = d_vectorIDs + totalNumVec * threadOrder;
+            // 1. 将上面刚提取完的庞大候选 ID 数组，从 CPU 推送到 GPU 显存
             cudaMemcpy(vectorID_temp, vectorIDs.data(), sizeof(SizeType) * numVector, cudaMemcpyHostToDevice);
+            // 2. 清空 GPU 里面存放答案（距离值）的空间
             float *dist_temp = d_dist + totalNumVec * threadOrder;
             cudaMemset(dist_temp, 0, sizeof(float) * numVector);
+            // 3. 触发 CUDA Kernel 函数 (computeDistanceWithGPU)
+            // GPU并行：拿着查表(table_temp)，去全量预处理压缩库(d_PQVectorSet)中找指定的ID(vectorID_temp)，并将算出的距离写进 dist_temp。
             computeDistanceWithGPU(d_PQVectorSet, vectorID_temp, table_temp, dist_temp, PQVectorDim, numVector * PQVectorDim, vectorIDs);
+            // 4. 计算完毕后，将 GPU 算出的几千上万个 float 距离值拉回 CPU (因为后续 SSD 调度逻辑全在 CPU 完成)
             float *h_dist_temp = h_dist + totalNumVec * threadOrder;
             cudaMemcpy(h_dist_temp, dist_temp, sizeof(float) * numVector, cudaMemcpyDeviceToHost);
 
+            // 板块 5：距离绑定与最终排序
             for (int i = 0; i < numVector; i++)
-                queryResults->AddPoint(vectorIDs[i], h_dist_temp[i]);
-            queryResults->SortResult();
+                queryResults->AddPoint(vectorIDs[i], h_dist_temp[i]);   // ID - 估算距离
+            queryResults->SortResult(); // 构建堆排序，找出距离最小（最靠前）的那些点
+            return ErrorCode::Success;
+        }
+
+        template <typename T>
+        ErrorCode Index<T>::SearchRaBitQIndex_GPU(
+            QueryResult& p_query, 
+            int dim, 
+            int bits_per_code, 
+            std::vector<int>& numVecPerPostinglist, 
+            std::vector<std::unique_ptr<int[]>>& postinglist, 
+            void* d_QuantizedVectorSet, 
+            float *d_rotated_query,         // 指向 GPU 显存上某个区块的旋转指针
+            float g_add,     // bond_meta
+            float k1xsumq,  //bond_meta
+            float g_error,  //bond_meta
+            int* d_vectorIDs, 
+            float *d_dist, 
+            float *h_dist, 
+            int totalNumVec, 
+            int threadOrder, 
+            std::unordered_set<int>& postingIDSet, 
+            SearchStats* p_stats) const
+        {
+            // ==========================================
+            // 板块 1：初始化与头部聚类动态剪枝 (同原始流程)
+            // ==========================================
+            auto cutStartTime = std::chrono::high_resolution_clock::now();
+            COMMON::QueryResultSet<T> *queryResults = (COMMON::QueryResultSet<T> *)&p_query;
+
+            COMMON::OptHashPosVector deduper;
+            deduper.Init(m_options.m_maxCheck, m_options.m_hashExp);
+
+            std::vector<SizeType> postingIDs;
+            // 获取动态距离阈值，将其传入 GPU 以阻断恶劣的候选向量
+            float limitDist = queryResults->GetResult(0)->Dist * m_options.m_maxDistRatio;
+            
+            int ii = 0;
+            for (; ii < m_options.m_searchInternalResultNum; ++ii)
+            {
+                auto res = queryResults->GetResult(ii);
+                if (res->VID == -1 || (limitDist > 0.1 && res->Dist > limitDist))
+                    continue;
+                    
+                if (numVecPerPostinglist[res->VID] != 0)
+                {
+                    postingIDs.push_back(res->VID);
+                }
+                
+                res->VID = static_cast<SizeType>((m_vectorTranslateMap.get())[res->VID]);
+                if (!m_options.m_enableReorderIndex) {
+                    postingIDSet.insert(res->VID);
+                }
+                if (res->VID == MaxSize) {
+                    res->VID = -1;
+                }
+            }
+            for (; ii < queryResults->GetResultNum(); ++ii)
+            {
+                auto res = queryResults->GetResult(ii);
+                if (res->VID == -1)
+                    continue;
+                res->VID = static_cast<SizeType>((m_vectorTranslateMap.get())[res->VID]);
+                if (!m_options.m_enableReorderIndex) {
+                    postingIDSet.insert(res->VID);
+                }
+                if (res->VID == MaxSize) {
+                    res->VID = -1;
+                }
+            }
+            
+            // 升序改降序
+            queryResults->Reverse();
+            auto cutEndTime = std::chrono::high_resolution_clock::now();
+            p_stats->cutTreeLatency = std::chrono::duration<double, std::milli>(cutEndTime - cutStartTime).count();
+
+            // ==========================================
+            // 板块 2 & 3：抽取底层候选向量 ID 池
+            // 这里彻底消除了 PQ 那套 d_table 的交互，转为传入 d_rotated_query
+            // ==========================================
+            const SizeType postingListCount = static_cast<SizeType>(postingIDs.size());
+            std::vector<SizeType> vectorIDs;
+
+            for (int pi = 1; pi <= postingListCount; ++pi)
+            {
+                SizeType postingID = postingIDs[pi - 1];
+                _mm_prefetch(reinterpret_cast<const char*>(postinglist[postingID].get()), _MM_HINT_T0);
+                int numvec = numVecPerPostinglist[postingID];
+                for (int vi = 0; vi < numvec; vi++)
+                {
+                    vectorIDs.push_back(postinglist[postingID][vi]);
+                }
+            }          
+
+            int numVector = vectorIDs.size();
+
+            // ==========================================
+            // 板块 4：向 GPU 下发显存交互及 RaBitQ 核函数运算
+            // ==========================================
+            int *vectorID_temp = d_vectorIDs + totalNumVec * threadOrder;
+            cudaMemcpy(vectorID_temp, vectorIDs.data(), sizeof(SizeType) * numVector, cudaMemcpyHostToDevice);
+            
+            float *dist_temp = d_dist + totalNumVec * threadOrder;
+            cudaMemset(dist_temp, 0, sizeof(float) * numVector);
+
+            // 转换外部类型结构体为 GPU 底层支持的结构，避免名字空间耦合 (可依据你在 process.h 怎么定义进行匹配)
+            BondMetaMetaGPU bond_meta_gpu;
+            bond_meta_gpu.g_add = g_add;
+            bond_meta_gpu.k1xsumq = k1xsumq;
+            bond_meta_gpu.g_error = g_error;
+
+            // 准备 GPU 专属的 local memory 空间存放 rotated_query (或者也可以从外层函数拷贝好这里直接用指针)
+            // 假定 d_rotated_query 已经包含了 CPU -> GPU 的 cudaMemcpy！(这里假设在 SSDIndex 调度层已经拷贝过)
+
+            computeRaBitQDistanceWithGPU(
+                d_QuantizedVectorSet, 
+                vectorID_temp, 
+                d_rotated_query, 
+                bond_meta_gpu, 
+                dist_temp, 
+                dim, 
+                bits_per_code,      // RaBitQ 专属参数：告知核函数步长
+                numVector, 
+                limitDist           // 引入 limitDist 到内侧做 Pruning
+            );
+
+            float *h_dist_temp = h_dist + totalNumVec * threadOrder;
+            cudaMemcpy(h_dist_temp, dist_temp, sizeof(float) * numVector, cudaMemcpyDeviceToHost);
+
+            // ==========================================
+            // 板块 5：距离绑定与最终排序
+            // ==========================================
+            for (int i = 0; i < numVector; i++)
+            {
+                // 核心剪枝验证：GPU 端的 ProcessRaBitQ 若检测到 lowerBound > limitDist, 
+                // 会将其赋值为大于 1e30f 的无穷大值。CPU 在这里直接过滤它，保护 SSD IO。
+                if (h_dist_temp[i] < 1e30f) 
+                {
+                    queryResults->AddPoint(vectorIDs[i], h_dist_temp[i]);
+                }
+            }
+            
+            // 最终排完序后的前几百个（由 resultNum 控制），才会被放去 SSD 触发 Rerank。
+            queryResults->SortResult(); 
+
             return ErrorCode::Success;
         }
 
@@ -770,48 +939,13 @@ namespace SPTAG
             // [RaBitQ Optimization] Pre-rotate query if using RaBitQ
             // 这是一个非常关键的优化，避免了在回调中重复旋转
             std::vector<float> rotatedQuery;
-            bool useRaBitQ = false;
-            const COMMON::RaBitQQuantizer<float>* rabitq_ptr_f = nullptr;
-            const COMMON::RaBitQQuantizer<std::uint8_t>* rabitq_ptr_u8 = nullptr;
+            bool useRaBitQ = (m_pQuantizer != nullptr && m_pQuantizer->GetQuantizerType() == QuantizerType::RaBitQQuantizer);
 
             if (m_pQuantizer && m_pQuantizer->GetQuantizerType() == QuantizerType::RaBitQQuantizer)
             {
-                if (m_pQuantizer->GetReconstructType() == VectorValueType::Float) {
-                    rabitq_ptr_f = static_cast<const COMMON::RaBitQQuantizer<float>*>(m_pQuantizer.get());
-                } else if (m_pQuantizer->GetReconstructType() == VectorValueType::UInt8) {
-                    rabitq_ptr_u8 = static_cast<const COMMON::RaBitQQuantizer<std::uint8_t>*>(m_pQuantizer.get());
-                }
-
-                useRaBitQ = (rabitq_ptr_f != nullptr || rabitq_ptr_u8 != nullptr);
-
                 if constexpr (std::is_same<T, float>::value || std::is_same<T, std::uint8_t>::value) {
                     if (useRaBitQ) {
-                        rotatedQuery.resize(m_options.m_dim + 16, 0.0f);
-
-                        if constexpr (std::is_same<T, float>::value) {
-                            if (rabitq_ptr_f) {
-                                rabitq_ptr_f->PreprocessQuery(targetVector, rotatedQuery.data());
-                            } else {
-                                std::vector<std::uint8_t> tempQ(m_options.m_dim);
-                                for (int i = 0; i < m_options.m_dim; ++i) {
-                                    float v = targetVector[i];
-                                    if (v < 0.0f) v = 0.0f;
-                                    if (v > 255.0f) v = 255.0f;
-                                    tempQ[i] = static_cast<std::uint8_t>(v + 0.5f);
-                                }
-                                rabitq_ptr_u8->PreprocessQuery(tempQ.data(), rotatedQuery.data());
-                            }
-                        } else { // T == uint8_t
-                            if (rabitq_ptr_u8) {
-                                rabitq_ptr_u8->PreprocessQuery(targetVector, rotatedQuery.data());
-                            } else {
-                                std::vector<float> tempQ(m_options.m_dim);
-                                for (int i = 0; i < m_options.m_dim; ++i) {
-                                    tempQ[i] = static_cast<float>(targetVector[i]);
-                                }
-                                rabitq_ptr_f->PreprocessQuery(tempQ.data(), rotatedQuery.data());
-                            }
-                        }
+                        m_pQuantizer->PreprocessQuery(targetVector, rotatedQuery.data());
                     }
                 } else {
                     useRaBitQ = false;
@@ -854,8 +988,7 @@ namespace SPTAG
                     // Here we pass rotatedQuery data pointer if useRaBitQ is true.
                     const float* rot_q_ptr = useRaBitQ ? rotatedQuery.data() : nullptr;
 
-                    // 修改后：添加了 useRaBitQ, rabitq_ptr, rot_q_ptr
-                    request.m_callback = [queryResults, j, buffer_ptr, alignedOffset, targetVector, pageCountref, readSize, this, useRaBitQ, rabitq_ptr_f, rabitq_ptr_u8, rot_q_ptr](bool success)
+                    request.m_callback = [queryResults, j, buffer_ptr, alignedOffset, targetVector, pageCountref, readSize, this, useRaBitQ, rot_q_ptr](bool success)
                     {
                         *pageCountref += readSize;
                         SPTAG::BasicResult* result = queryResults->GetResult(j);
@@ -868,14 +1001,9 @@ namespace SPTAG
 
                         const size_t dataOffset = static_cast<size_t>(result->VID) * vecSize + 2 * sizeof(int) - alignedOffset;
 
-                        if (useRaBitQ && (rabitq_ptr_f != nullptr || rabitq_ptr_u8 != nullptr))
-                        {
+                        if (useRaBitQ) {
                             const uint8_t* compressed_vec = reinterpret_cast<const uint8_t*>(buffer_ptr + dataOffset);
-                            if (rabitq_ptr_f) {
-                                result->Dist = rabitq_ptr_f->L2Distance(rot_q_ptr, compressed_vec);
-                            } else {
-                                result->Dist = rabitq_ptr_u8->L2Distance(rot_q_ptr, compressed_vec);
-                            }
+                            result->Dist = m_pQuantizer->L2Distance(rot_q_ptr, reinterpret_cast<const std::uint8_t*>(compressed_vec));
                         }
                         else
                         {

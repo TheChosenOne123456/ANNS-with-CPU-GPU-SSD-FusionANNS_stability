@@ -200,3 +200,149 @@ void processFunction1(void *d_PQVectorSet, int *d_vectorIDs, void *d_table, std:
     cudaFree(d_dist);
     // cudaStreamDestroy(stream);
 }
+
+// 在 GPU 上实现标量的 Bit 解压和向量跟 Float 内积的计算引擎
+__device__ float cuda_rabitq_inner_product(
+    const float* d_query, 
+    const uint8_t* d_code, 
+    int dim, 
+    int bits_per_code)
+{
+    float ip = 0.0f;
+    int elements_per_byte = 8 / bits_per_code;
+    int mask = (1 << bits_per_code) - 1;
+
+    // // GPU 的一个优化技巧是可以将 4 个 bytes 组合成 uint32_t 进行更快的内存读取，
+    // // 但为了代码通用并匹配你原本的数据结构，我们按照 Byte 粒度解包。
+    int byte_idx = 0;
+    int shift = 0;
+
+    for (int i = 0; i < dim; i++) {
+        // 提取解包位
+        uint8_t val = (d_code[byte_idx] >> shift) & mask;
+        ip += d_query[i] * static_cast<float>(val);
+
+        // 步进
+        shift += bits_per_code;
+        if (shift >= 8) {
+            shift = 0;
+            byte_idx++;
+        }
+    }
+    return ip;
+}
+
+// 这是相当于 rabitqlib::quant::full_est_dist 的 GPU 等效版本
+__device__ float cuda_rabitq_full_est_dist(
+    const uint8_t* d_code, 
+    const float* d_query, 
+    int dim, 
+    int bits_per_code,
+    float f_add, 
+    float f_rescale, 
+    float g_add, 
+    float k1xsumq)
+{
+    // 利用我们写的内部拆包函数做内积：IP(q, c)
+    float ip = cuda_rabitq_inner_product(d_query, d_code, dim, bits_per_code);
+
+    // 原封不动复刻论文论文中的 full_est 计算：
+    // std::sqrt(g_add + meta->f_add + k1xsumq + meta->f_rescale * ip)
+    float inner_val = g_add + f_add + k1xsumq + f_rescale * ip;
+    return (inner_val > 0.0f) ? std::sqrt(inner_val) : 0.0f; 
+}
+
+// ----------------------------------------------------
+// 我们新的 Kernel 函数
+// ----------------------------------------------------
+__global__ void ProcessRaBitQ(
+    void     *d_QuantizedVectorSet, 
+    int      *d_vectorIDs, 
+    float    *d_rotated_query, 
+    BondMetaMetaGPU bond_meta,  // (注意这里名字定义为了避免与头文件冲突，可以在头文件定义传入)
+    float    *d_dist, 
+    int       dim, 
+    int       bits_per_code, // 【新增传入】告诉 GPU 当前是几 Bit 重建
+    int       count,
+    float     limitDist)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count)
+    {
+        int vid = d_vectorIDs[idx];
+        if (vid >= 0)
+        {
+            // RaBitQ 数据结构：
+            // 前 5 个 float 是 Meta (delta, vl, f_add, f_rescale, f_error)，占用 20 个字节
+            // 后面紧接着才是 Quantized Code。
+            int meta_size = 5 * sizeof(float);
+            // 计算 packed 占用的字节数（向上取整）
+            int code_bytes = (dim * bits_per_code + 7) / 8;
+            int total_bytes_per_vec = meta_size + code_bytes;
+
+            // 定位到当前这个候选向量在全局大数组 `d_QuantizedVectorSet` 里的物理内存起始位
+            uint8_t* pY = ((uint8_t*)d_QuantizedVectorSet) + ((size_t)vid * total_bytes_per_vec);
+
+            // 获取该向量头部的 Meta 数据
+            float* meta_ptr = (float*)pY;
+            float f_add     = meta_ptr[2];
+            float f_rescale = meta_ptr[3];
+            float f_error   = meta_ptr[4];
+
+            // Code 区间的起始指针
+            uint8_t* code_ptr = pY + meta_size;
+
+            // 1. 调用上方写的 GPU 版全预估距离函数 (等价于 CPU 的 L2DistanceEstimate)
+            float estimateDist = cuda_rabitq_full_est_dist(
+                code_ptr, d_rotated_query, dim, bits_per_code, 
+                f_add, f_rescale, bond_meta.g_add, bond_meta.k1xsumq
+            );
+
+            // 2. 计算误差下限 (用于保守剪枝)
+            float low_dist = estimateDist - (f_error * bond_meta.g_error);
+
+            // 3. 剪枝策略！这是融合进 GPU 的精髓。
+            if (low_dist > limitDist) {
+                // 如果最理想（最短）都没希望比当前搜出的最远聚类还小，它连去 SSD 重排的资格都没有。
+                // 我们直接标记其距离为 3e38f，后续 CPU 收到就会丢弃它
+                d_dist[idx] = 3e38f; 
+            } else {
+                d_dist[idx] = estimateDist;
+            }
+        }
+        else 
+        {
+            d_dist[idx] = 3e38f; // 若 id < 0 或者失效的，同理丢弃
+        }
+    }
+}
+
+void computeRaBitQDistanceWithGPU(
+    void     *d_QuantizedVectorSet, 
+    int      *d_vectorIDs, 
+    float    *d_rotated_query, 
+    BondMetaMetaGPU bond_meta, 
+    float    *d_dist, 
+    int       dim, 
+    int       bits_per_code, 
+    int       count, 
+    float     limitDist) 
+{
+    // 每个线程负责一个候选向量的内算，配置合理的 block 大小
+    int block = 256; 
+    int grid = (count + block - 1) / block;
+
+    ProcessRaBitQ<<<grid, block>>>(
+        d_QuantizedVectorSet, 
+        d_vectorIDs, 
+        d_rotated_query, 
+        bond_meta, 
+        d_dist, 
+        dim, 
+        bits_per_code, 
+        count, 
+        limitDist
+    );
+
+    cudaDeviceSynchronize();
+}

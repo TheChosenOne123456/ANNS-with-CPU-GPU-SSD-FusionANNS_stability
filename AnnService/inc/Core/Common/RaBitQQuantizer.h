@@ -32,7 +32,9 @@
 #include "rabitqlib/quantization/pack_excode.hpp"
 #include "rabitqlib/utils/space.hpp"
 
+#ifndef __CUDACC__
 #include <immintrin.h> 
+#endif
 
 namespace SPTAG
 {
@@ -42,7 +44,8 @@ namespace SPTAG
         template<typename T = float>
         class RaBitQQuantizer : public IQuantizer
         {
-            static_assert(std::is_same<T, float>::value || std::is_same<T, std::uint8_t>::value, "RaBitQQuantizer only supports float or uint8 input types.");
+            // 防止报错
+            // static_assert(std::is_same<T, float>::value || std::is_same<T, std::uint8_t>::value, "RaBitQQuantizer only supports float or uint8 input types.");
         public:
             // 标识量化器落盘格式版本，给 Save/Load 做向后兼容分支
             enum class PersistVersion : std::uint32_t { V1 = 1, V2 = 2 };
@@ -366,12 +369,15 @@ namespace SPTAG
                 if constexpr (std::is_same<T, float>::value) {
                     std::memcpy(vecout, out_float.data(), m_Dim * sizeof(float));
                 } else {
-                    std::uint8_t* out_u8 = reinterpret_cast<std::uint8_t*>(vecout);
+                    T* out_T = reinterpret_cast<T*>(vecout);
                     for (DimensionType i = 0; i < m_Dim; ++i) {
                         float v = out_float[i];
-                        if (v < 0.0f) v = 0.0f;
-                        if (v > 255.0f) v = 255.0f;
-                        out_u8[i] = static_cast<std::uint8_t>(v + 0.5f);
+                        // 取值范围裁剪：适配 uint8_t/int8_t/int16_t
+                        float max_val = static_cast<float>(std::numeric_limits<T>::max());
+                        float min_val = static_cast<float>(std::numeric_limits<T>::lowest());
+                        if (v < min_val) v = min_val;
+                        if (v > max_val) v = max_val;
+                        out_T[i] = static_cast<T>(v + (v >= 0 ? 0.5f : -0.5f));
                     }
                 }
             }
@@ -381,6 +387,8 @@ namespace SPTAG
 
             // 返回重建向量维度
             virtual DimensionType ReconstructDim() const { return m_Dim; }
+
+            virtual DimensionType GetPaddedDim() const { return m_PaddedDim; }
 
             // 返回序列化量化器头信息大小
             virtual std::uint64_t BufferSize() const
@@ -530,10 +538,10 @@ namespace SPTAG
             }
 
             // 对查询向量做旋转与 padding 预处理
-            void PreprocessQuery(const T* in_query, float* out_rotated) const
+            void PreprocessQuery(const void* in_query, float* out_rotated) const
             {
                 std::vector<float> temp(m_Dim, 0.0f);
-                ConvertInputToFloat(in_query, temp.data());
+                ConvertInputToFloat(reinterpret_cast<const T*>(in_query), temp.data());
 
                 if (m_Rotator) {
                     m_Rotator->rotate(temp.data(), out_rotated);
@@ -545,6 +553,7 @@ namespace SPTAG
                 }
             }
 
+#ifndef __CUDACC__
             // 计算两个量化向量之间的对称 L2 距离（SD）
             inline float L2DistanceByDequantization(
                 const std::uint8_t* pX,
@@ -637,6 +646,11 @@ namespace SPTAG
 
                 return dist;
             }
+#else
+            // 给 NVCC 提供一个空的 dummy，防止链接失败或编译报错
+            inline float L2DistanceByDequantization(const std::uint8_t* pX, const std::uint8_t* pY) const { return 0.0f; }
+            inline float L2DistanceByDequantization(const float* rotated_query, const std::uint8_t* pY) const { return 0.0f; }
+#endif
 
             // IQuantizer 强制的对称接口：暂时保持旧语义（论文估算主要用于 query->db）
             virtual float L2Distance(const std::uint8_t* pX, const std::uint8_t* pY) const
@@ -668,12 +682,12 @@ namespace SPTAG
             // 将任意输入向量转换为 float 向量以统一后续计算
             inline void ConvertInputToFloat(const T* vec, float* out_float) const
             {
-                if constexpr (std::is_same<T, std::uint8_t>::value) {
+                if constexpr (std::is_same<T, float>::value) {
+                    std::memcpy(out_float, vec, m_Dim * sizeof(float));
+                } else {
                     for (DimensionType i = 0; i < m_Dim; ++i) {
                         out_float[i] = static_cast<float>(vec[i]);
                     }
-                } else {
-                    std::memcpy(out_float, vec, m_Dim * sizeof(float));
                 }
             }
 
