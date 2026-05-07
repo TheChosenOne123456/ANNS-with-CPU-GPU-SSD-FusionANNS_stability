@@ -63,7 +63,9 @@ namespace SPTAG
                   m_EnableADC(false),
                   m_BitsPerCode(4),
                   m_RotatorType(RotatorStorageType::FhtKac),
-                  m_FormatVersion(PersistVersion::V2)
+                  m_FormatVersion(PersistVersion::V2),
+                  m_hasCentroid(0),
+                  m_Centroid(nullptr)
             {
             }
 
@@ -243,10 +245,8 @@ namespace SPTAG
             }
 
             // 训练阶段仅用于选择旋转器和更新尺寸
-            void Train(const void* data, SizeType num)
+            void Train(const void* data, SizeType num, bool useCentroid = false)
             {
-                (void)data;
-                (void)num;
                 if (!m_Rotator) {
                     if (m_RotatorType == RotatorStorageType::Matrix) {
                         m_Rotator = rabitqlib::choose_rotator<float>(
@@ -262,6 +262,27 @@ namespace SPTAG
                     //     );
                     RecalcSizes();
                 }
+                if (!useCentroid || data == nullptr || num == 0) {
+                    m_Centroid.reset();
+                    m_hasCentroid = 0;
+                    return;
+                }
+
+                m_hasCentroid = 1;
+                m_Centroid.reset(new std::vector<float>(m_Dim, 0.0f));
+                const T* p = reinterpret_cast<const T*>(data);
+
+                for (SizeType n = 0; n < num; ++n) {
+                    const T* v = p + static_cast<size_t>(n) * m_Dim;
+                    for (DimensionType d = 0; d < m_Dim; ++d) {
+                        (*m_Centroid)[d] += static_cast<float>(v[d]);
+                    }
+                }
+
+                const float inv = 1.0f / static_cast<float>(num);
+                for (DimensionType d = 0; d < m_Dim; ++d) {
+                    (*m_Centroid)[d] *= inv;
+                }
             }
 
             // 将原始向量量化为指定码值并写入 meta 信息
@@ -270,6 +291,13 @@ namespace SPTAG
                 (void)ADC;
                 std::vector<float> fvec(m_Dim);
                 ConvertInputToFloat(reinterpret_cast<const T*>(vec), fvec.data());
+
+                if (m_Centroid != nullptr && m_hasCentroid == 1) {
+                    // 减质心
+                    for (DimensionType i = 0; i < m_Dim; ++i) {
+                        fvec[i] -= (*m_Centroid)[i];
+                    }
+                }
 
                 std::vector<float> rotated_vec(m_PaddedDim, 0.0f);
                 if (m_Rotator) {
@@ -281,13 +309,51 @@ namespace SPTAG
                 auto* meta = reinterpret_cast<RaBitQEstimateMeta*>(vecout);
                 uint8_t* bin_ptr = reinterpret_cast<uint8_t*>(vecout + m_MetaSize);
 
-                // 准备两个全尺寸的缓冲来接收量化结果
+                // delta vl
+                float delta = 0.0f;
+                float vl = 0.0f;
+
+                // 2) 额外计算论文估算需要的 f_add/f_rescale/f_error
+                float f_add = 0.0f;
+                float f_rescale = 0.0f;
+                float f_error = 0.0f;
+
+                if (m_BitsPerCode == 1) {
+                    // 1) 先算 delta/vl（total_bits=1）
+                    std::vector<uint8_t> temp_scalar_code(m_PaddedDim, 0);
+                    rabitqlib::quant::quantize_scalar(
+                        rotated_vec.data(),
+                        m_PaddedDim,
+                        static_cast<size_t>(1),
+                        temp_scalar_code.data(),
+                        delta,
+                        vl
+                    );
+
+                    // 对于 1-bit：直接调用 rabitq 的 compact 接口（它会写入压缩的二进制码并返回 f_*）
+                    rabitqlib::quant::quantize_compact_one_bit(
+                        rotated_vec.data(),
+                        m_PaddedDim,
+                        bin_ptr,      // 直接写入压缩位码（padded_dim/8 bytes）
+                        f_add,
+                        f_rescale,
+                        f_error,
+                        rabitqlib::METRIC_L2
+                    );
+
+                    // 将 meta 写回（delta/vl 已计算）
+                    meta->delta = delta;
+                    meta->vl = vl;
+                    meta->f_add = f_add;
+                    meta->f_rescale = f_rescale;
+                    meta->f_error = f_error;
+                    return;
+                }
+
+                // 多 bit 路径（保持原逻辑）：先得到 full byte 格式，再 packing 到 bin_ptr
                 std::vector<uint8_t> temp_scalar_code(m_PaddedDim, 0);
                 std::vector<uint8_t> temp_full_code(m_PaddedDim, 0);
 
-                // 1) 保留原来的 scalar 量化（用于重构与旧路径兼容）
-                float delta = 0.0f;
-                float vl = 0.0f;
                 rabitqlib::quant::quantize_scalar(
                     rotated_vec.data(),
                     m_PaddedDim,
@@ -296,11 +362,6 @@ namespace SPTAG
                     delta,
                     vl
                 );
-
-                // 2) 额外计算论文估算需要的 f_add/f_rescale/f_error
-                float f_add = 0.0f;
-                float f_rescale = 0.0f;
-                float f_error = 0.0f;
 
                 rabitqlib::quant::quantize_full_single<float, uint8_t>(
                     rotated_vec.data(),
@@ -313,12 +374,12 @@ namespace SPTAG
                     rabitqlib::METRIC_L2
                 );
 
-            #ifndef NDEBUG
+#ifndef NDEBUG
                 // 两条路径理论上应产生一致码字；调试期做一致性检查
                 if (std::memcmp(temp_full_code.data(), temp_scalar_code.data(), m_PaddedDim) != 0) {
                     SPTAGLIB_LOG(Helper::LogLevel::LL_Warning, "RaBitQ scalar/full code mismatch detected.\n");
                 }
-            #endif
+#endif
 
                 // 【新增】将 1-byte 宽度的临时量化码压缩成我们设定的比特位，压实到 bin_ptr 中
                 rabitqlib::quant::rabitq_impl::ex_bits::packing_rabitqplus_code(
@@ -365,6 +426,15 @@ namespace SPTAG
                     std::memcpy(out_float.data(), rotated_reconst.data(), m_Dim * sizeof(float));
                 }
 
+                // 如果启用了中心化，重建回原空间时需要把质心加回来
+                if (m_hasCentroid == 1 &&
+                    m_Centroid != nullptr &&
+                    m_Centroid->size() == static_cast<size_t>(m_Dim)) {
+                    for (DimensionType i = 0; i < m_Dim; ++i) {
+                        out_float[i] += (*m_Centroid)[i];
+                    }
+                }
+
                 // 重建结果的类型落地转换，uint8 版本需要做范围裁剪和四舍五入
                 if constexpr (std::is_same<T, float>::value) {
                     std::memcpy(vecout, out_float.data(), m_Dim * sizeof(float));
@@ -394,10 +464,15 @@ namespace SPTAG
             virtual std::uint64_t BufferSize() const
             {
                 // qtype + rtype + version + dim + padded + bits + rotType + magic + blobSize + blob
-                return sizeof(QuantizerType) + sizeof(VectorValueType) + sizeof(std::uint32_t) +
+                std::uint64_t base = sizeof(QuantizerType) + sizeof(VectorValueType) + sizeof(std::uint32_t) +
                        sizeof(DimensionType) + sizeof(DimensionType) + sizeof(SizeType) +
                        sizeof(std::uint8_t) + sizeof(std::uint32_t) + sizeof(std::uint64_t) +
                        RotatorBlobBytes();
+                base += sizeof(std::uint8_t); // m_hasCentroid
+                if (m_Centroid != nullptr && m_hasCentroid == 1) {
+                    base += static_cast<std::uint64_t>(m_Dim) * sizeof(float);
+                }
+                return base;
             }
 
             // 保存量化器配置到磁盘流
@@ -430,6 +505,10 @@ namespace SPTAG
                 IOBINARY(p_out, WriteBinary, sizeof(std::uint64_t), (char*)&blobBytes);
                 if (blobBytes > 0) {
                     IOBINARY(p_out, WriteBinary, blobBytes, (char*)rotBlob.data());
+                }
+                IOBINARY(p_out, WriteBinary, sizeof(std::uint8_t), (char*)&m_hasCentroid);
+                if (m_Centroid != nullptr && m_hasCentroid == 1) {
+                    IOBINARY(p_out, WriteBinary, sizeof(float) * m_Dim, (char*)m_Centroid->data());
                 }
                 return ErrorCode::Success;
             }
@@ -486,6 +565,15 @@ namespace SPTAG
                 if (ErrorCode::Success != RebuildRotator(m_Dim, m_PaddedDim, m_RotatorType)) return ErrorCode::Fail;
                 if (ErrorCode::Success != DeserializeRotator(rotBlob)) return ErrorCode::Fail;
 
+                IOBINARY(p_in, ReadBinary, sizeof(std::uint8_t), (char*)&m_hasCentroid);
+                if (m_hasCentroid == 1) {
+                    m_Centroid.reset(new std::vector<float>(m_Dim));
+                    IOBINARY(p_in, ReadBinary, sizeof(float) * m_Dim, (char*)m_Centroid->data());
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "After read using centroid.\n");
+                } else {
+                    m_Centroid.reset();
+                }
+
                 RecalcSizes();
                 SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Loading RaBitQQuantizer finished.\n");
                 return ErrorCode::Success;
@@ -523,10 +611,21 @@ namespace SPTAG
                 if (blobBytes > 0) {
                     std::memcpy(rotBlob.data(), ptr, blobBytes);
                 }
+                ptr += blobBytes;
 
                 if (ErrorCode::Success != RebuildRotator(m_Dim, m_PaddedDim, m_RotatorType)) return ErrorCode::Fail;
                 if (ErrorCode::Success != DeserializeRotator(rotBlob)) return ErrorCode::Fail;
 
+                m_hasCentroid = *ptr; 
+                ptr += sizeof(std::uint8_t);
+                if (m_hasCentroid == 1) {
+                    m_Centroid.reset(new std::vector<float>(m_Dim));
+                    std::memcpy(m_Centroid->data(), ptr, sizeof(float) * m_Dim);
+                    ptr += sizeof(float) * m_Dim;
+                } else {
+                    m_Centroid.reset();
+                }
+                
                 RecalcSizes();
                 return ErrorCode::Success;
             }
@@ -542,6 +641,13 @@ namespace SPTAG
             {
                 std::vector<float> temp(m_Dim, 0.0f);
                 ConvertInputToFloat(reinterpret_cast<const T*>(in_query), temp.data());
+
+                if (m_Centroid != nullptr && m_Centroid->size() == m_Dim) {
+                    // 1) 查询向量也必须做同样的中心化
+                    for (DimensionType i = 0; i < m_Dim; ++i) {
+                        temp[i] -= (*m_Centroid)[i];
+                    }
+                }
 
                 if (m_Rotator) {
                     m_Rotator->rotate(temp.data(), out_rotated);
@@ -878,6 +984,9 @@ namespace SPTAG
             
             RotatorStorageType m_RotatorType;
             PersistVersion m_FormatVersion;
+
+            std::uint8_t m_hasCentroid = 0; // 0 表示未启用质心，1 表示启用质心
+            std::unique_ptr<std::vector<float>> m_Centroid = nullptr; // 为空表示未启用质心
         };
     }
 }

@@ -205,14 +205,14 @@ int main(int argc, char* argv[])
                 case VectorValueType::Float: {
                     auto rq = std::make_shared<COMMON::RaBitQQuantizer<float>>(options->m_dimension);
                     if (options->m_quantizedDim > 0) rq->SetBitsPerCode((SizeType)options->m_quantizedDim);
-                    rq->Train(set->GetData(), set->Count());
+                    rq->Train(set->GetData(), set->Count(), true);
                     quantizer = rq;
                     break;
                 }
                 case VectorValueType::UInt8: {
                     auto rq = std::make_shared<COMMON::RaBitQQuantizer<std::uint8_t>>(options->m_dimension);
                     if (options->m_quantizedDim > 0) rq->SetBitsPerCode((SizeType)options->m_quantizedDim);
-                    rq->Train(set->GetData(), set->Count());
+                    rq->Train(set->GetData(), set->Count(), true);
                     quantizer = rq;
                     break;
                 }
