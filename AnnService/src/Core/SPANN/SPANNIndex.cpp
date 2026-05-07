@@ -6,6 +6,8 @@
 #include "inc/Core/SPANN/ExtraFullGraphSearcher.h"
 #include "inc/SSDServing/process.h"
 
+#include "rabitqlib/quantization/rabitq.hpp"
+#include "rabitqlib/quantization/pack_excode.hpp"
 
 #include "cuda_runtime.h"
 
@@ -850,7 +852,7 @@ namespace SPTAG
                 }
             }
             
-            // 升序改降序
+            // 升序改降序，比第0位距离更小，就替换
             queryResults->Reverse();
             auto cutEndTime = std::chrono::high_resolution_clock::now();
             p_stats->cutTreeLatency = std::chrono::duration<double, std::milli>(cutEndTime - cutStartTime).count();
@@ -914,17 +916,73 @@ namespace SPTAG
             // ==========================================
 
             // 测试
-            if (threadOrder == 0 && numVector > 10) {
-                 static std::atomic<int> printCount{0};
-                 if (printCount.fetch_add(1) < 2) { // 全局只打印前两次 Query 的调试信息，防刷屏
-                     SPTAGLIB_LOG(Helper::LogLevel::LL_Info, 
-                         "TEST GPU OUT [Q%d]: limitDist=%f, bond_meta(g_add=%f, error=%f)\n", 
-                         printCount.load(), limitDist, bond_meta_gpu.g_add, bond_meta_gpu.g_error);
-                     SPTAGLIB_LOG(Helper::LogLevel::LL_Info, 
-                         "TEST H_DIST_TEMP: ID[0]:%d -> Dist:%f, ID[1]:%d -> Dist:%f, ID[2]:%d -> Dist:%f\n",
-                         vectorIDs[0], h_dist_temp[0], vectorIDs[1], h_dist_temp[1], vectorIDs[2], h_dist_temp[2]);
-                 }
-            } 
+            // if (threadOrder == 0 && numVector > 10) {
+            //      static std::atomic<int> printCount{0};
+            //      if (printCount.fetch_add(1) < 2) { // 全局只打印前两次 Query 的调试信息，防刷屏
+            //          SPTAGLIB_LOG(Helper::LogLevel::LL_Info, 
+            //              "TEST GPU OUT [Q%d]: limitDist=%f, bond_meta(g_add=%f, error=%f)\n", 
+            //              printCount.load(), limitDist, bond_meta_gpu.g_add, bond_meta_gpu.g_error);
+            //          SPTAGLIB_LOG(Helper::LogLevel::LL_Info, 
+            //              "TEST H_DIST_TEMP: ID[0]:%d -> Dist:%f, ID[1]:%d -> Dist:%f, ID[2]:%d -> Dist:%f\n",
+            //              vectorIDs[0], h_dist_temp[0], vectorIDs[1], h_dist_temp[1], vectorIDs[2], h_dist_temp[2]);
+            //      }
+            // } 
+            ///////////////////////////////////////////////////////////////////////////////
+            // // 只打印前2次，避免刷屏
+            // static std::atomic<int> s_cmp_print_count{0};
+            // if (s_cmp_print_count.fetch_add(1, std::memory_order_relaxed) < 2 &&
+            //     numVector > 0 && vectorIDs[0] >= 0)
+            // {
+            //     const int vid0 = vectorIDs[0];
+
+            //     const size_t metaBytes = 3 * sizeof(float); // GPU紧凑格式: f_add, f_rescale, f_error
+            //     const size_t codeBytes = (static_cast<size_t>(dim) * static_cast<size_t>(bits_per_code) + 7) / 8;
+            //     const size_t bytesPerVec = metaBytes + codeBytes;
+
+            //     std::vector<uint8_t> h_vec(bytesPerVec);
+            //     std::vector<float> h_query(dim, 0.0f);
+
+            //     cudaMemcpy(
+            //         h_vec.data(),
+            //         reinterpret_cast<uint8_t*>(d_QuantizedVectorSet) + static_cast<size_t>(vid0) * bytesPerVec,
+            //         bytesPerVec,
+            //         cudaMemcpyDeviceToHost
+            //     );
+
+            //     cudaMemcpy(
+            //         h_query.data(),
+            //         d_rotated_query,
+            //         sizeof(float) * dim,
+            //         cudaMemcpyDeviceToHost
+            //     );
+
+            //     const float* meta = reinterpret_cast<const float*>(h_vec.data()); // [0]=f_add [1]=f_rescale [2]=f_error
+            //     const uint8_t* code = h_vec.data() + metaBytes;
+
+            //     auto ipFunc = rabitqlib::select_excode_ipfunc(bits_per_code);
+
+            //     float est_lib = rabitqlib::quant::full_est_dist<float, uint8_t>(
+            //         code,
+            //         h_query.data(),
+            //         ipFunc,
+            //         dim,
+            //         bits_per_code,
+            //         meta[0],      // f_add
+            //         meta[1],      // f_rescale
+            //         g_add,
+            //         k1xsumq
+            //     );
+
+            //     float low_lib = est_lib - meta[2] * g_error;
+            //     float est_gpu = h_dist_temp[0];
+
+            //     SPTAGLIB_LOG(
+            //         Helper::LogLevel::LL_Info,
+            //         "TEST CPUvsGPU: vid=%d gpu_est=%f lib_est=%f diff=%f lib_low=%f limit=%f\n",
+            //         vid0, est_gpu, est_lib, std::abs(est_gpu - est_lib), low_lib, limitDist
+            //     );
+            // }
+            ///////////////////////////////////////////////////////////////////////////////////
 
             for (int i = 0; i < numVector; i++)
             {
@@ -937,7 +995,7 @@ namespace SPTAG
             }
             
             // 最终排完序后的前几百个（由 resultNum 控制），才会被放去 SSD 触发 Rerank。
-            queryResults->SortResult(); 
+            queryResults->SortResult();     // 升序
 
             return ErrorCode::Success;
         }
@@ -1183,6 +1241,7 @@ namespace SPTAG
         {
             // 测试
             // std::cout << "TEST : RerankFullVectorFusion is called." << std::endl;
+            // 1) 结果容器与查询向量
             COMMON::QueryResultSet<T> *queryResults = (COMMON::QueryResultSet<T> *)&p_query;
             const T* targetVector = reinterpret_cast<const T *>(queryResults->GetTarget());
             std::unordered_map<int64_t, Helper::AsyncReadRequest> uniqueRequests;
@@ -1191,6 +1250,7 @@ namespace SPTAG
 
             int pageCount = 0;
             int* pageCountref = &pageCount;
+            // 遍历前 m_resultNum 个候选
             for (int j = 0; j < m_options.m_resultNum; j++) {
                 auto result = queryResults->GetResult(j);
                 if (result->VID < 0 || m_vectorMapPosting[result->VID] < 0)

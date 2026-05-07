@@ -249,7 +249,7 @@ __device__ float cuda_rabitq_full_est_dist(
     // 原封不动复刻论文论文中的 full_est 计算：
     // std::sqrt(g_add + meta->f_add + k1xsumq + meta->f_rescale * ip)
     float inner_val = g_add + f_add + k1xsumq + f_rescale * ip;
-    return (inner_val > 0.0f) ? std::sqrt(inner_val) : 0.0f; 
+    return (inner_val > 0.0f) ? inner_val : 0.0f; 
 }
 
 // ----------------------------------------------------
@@ -275,7 +275,7 @@ __global__ void ProcessRaBitQ(
             // RaBitQ 数据结构：
             // 前 5 个 float 是 Meta (delta, vl, f_add, f_rescale, f_error)，占用 20 个字节
             // 后面紧接着才是 Quantized Code。
-            int meta_size = 5 * sizeof(float);
+            int meta_size = 3 * sizeof(float);  // 去掉delta和vl
             // 计算 packed 占用的字节数（向上取整）
             int code_bytes = (dim * bits_per_code + 7) / 8;
             int total_bytes_per_vec = meta_size + code_bytes;
@@ -285,12 +285,26 @@ __global__ void ProcessRaBitQ(
 
             // 获取该向量头部的 Meta 数据
             float* meta_ptr = (float*)pY;
-            float f_add     = meta_ptr[2];
-            float f_rescale = meta_ptr[3];
-            float f_error   = meta_ptr[4];
+            // 去掉delta和vl之后，位置也要减2
+            float f_add     = meta_ptr[0];
+            float f_rescale = meta_ptr[1];
+            float f_error   = meta_ptr[2];
 
             // Code 区间的起始指针
             uint8_t* code_ptr = pY + meta_size;
+            /////////////////////////////////////////////////////////////////////////////////////
+            // // 在 ProcessRaBitQ 内部直接展开计算，便于调试
+            // float ip = cuda_rabitq_inner_product(
+            //     d_rotated_query, code_ptr, dim, bits_per_code
+            // );
+
+            // float inner_val = bond_meta.g_add + f_add + bond_meta.k1xsumq + f_rescale * ip;
+
+            // if (idx == 0) {
+            //     printf("TEST : inner_val=%f, ip=%f, f_add=%f, f_rescale=%f, g_add=%f, k1xsumq=%f\n",
+            //         inner_val, ip, f_add, f_rescale, bond_meta.g_add, bond_meta.k1xsumq);
+            // }
+            /////////////////////////////////////////////////////////////////////////////////////
 
             // 1. 调用上方写的 GPU 版全预估距离函数 (等价于 CPU 的 L2DistanceEstimate)
             float estimateDist = cuda_rabitq_full_est_dist(
@@ -350,7 +364,7 @@ void computeRaBitQDistanceWithGPU(
     // 同步并捕获 Kernel 自身崩溃的异常
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
-        // printf("CUDA KERNEL KILLED! Error: %s\n", cudaGetErrorString(err));
+        printf("CUDA KERNEL KILLED! Error: %s\n", cudaGetErrorString(err));
     }
-    // cudaDeviceSynchronize();
+    cudaDeviceSynchronize();
 }
