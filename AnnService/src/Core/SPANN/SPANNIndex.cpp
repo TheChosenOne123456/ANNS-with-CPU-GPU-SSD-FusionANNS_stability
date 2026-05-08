@@ -779,8 +779,16 @@ namespace SPTAG
             cudaMemcpy(h_dist_temp, dist_temp, sizeof(float) * numVector, cudaMemcpyDeviceToHost);
 
             // 板块 5：距离绑定与最终排序
-            for (int i = 0; i < numVector; i++)
-                queryResults->AddPoint(vectorIDs[i], h_dist_temp[i]);   // ID - 估算距离
+            // 测试
+            std::cout << "worstDist = " << queryResults->worstDist() << ", h_dist_temp[0] = " << h_dist_temp[0] << std::endl;
+            int addPointSuccess = 0;
+            for (int i = 0; i < numVector; i++){
+                if(queryResults->AddPoint(vectorIDs[i], h_dist_temp[i]) == true){
+                    addPointSuccess++;
+                }
+            }
+                // queryResults->AddPoint(vectorIDs[i], h_dist_temp[i]);   // ID - 估算距离
+            // std::cout << "TEST : AddPoint success count: " << addPointSuccess << std::endl;
             queryResults->SortResult(); // 构建堆排序，找出距离最小（最靠前）的那些点
             return ErrorCode::Success;
         }
@@ -915,7 +923,7 @@ namespace SPTAG
             // 板块 5：距离绑定与最终排序
             // ==========================================
 
-            // 测试
+            // // 测试
             // if (threadOrder == 0 && numVector > 10) {
             //      static std::atomic<int> printCount{0};
             //      if (printCount.fetch_add(1) < 2) { // 全局只打印前两次 Query 的调试信息，防刷屏
@@ -928,71 +936,76 @@ namespace SPTAG
             //      }
             // } 
             ///////////////////////////////////////////////////////////////////////////////
-            // // 只打印前2次，避免刷屏
-            // static std::atomic<int> s_cmp_print_count{0};
-            // if (s_cmp_print_count.fetch_add(1, std::memory_order_relaxed) < 2 &&
-            //     numVector > 0 && vectorIDs[0] >= 0)
-            // {
-            //     const int vid0 = vectorIDs[0];
+            // 只打印前2次，避免刷屏
+            static std::atomic<int> s_cmp_print_count{0};
+            if (s_cmp_print_count.fetch_add(1, std::memory_order_relaxed) < 2 &&
+                numVector > 0 && vectorIDs[0] >= 0)
+            {
+                const int vid0 = vectorIDs[0];
 
-            //     const size_t metaBytes = 3 * sizeof(float); // GPU紧凑格式: f_add, f_rescale, f_error
-            //     const size_t codeBytes = (static_cast<size_t>(dim) * static_cast<size_t>(bits_per_code) + 7) / 8;
-            //     const size_t bytesPerVec = metaBytes + codeBytes;
+                const size_t metaBytes = 3 * sizeof(float); // GPU紧凑格式: f_add, f_rescale, f_error
+                const size_t codeBytes = (static_cast<size_t>(dim) * static_cast<size_t>(bits_per_code) + 7) / 8;
+                const size_t bytesPerVec = metaBytes + codeBytes;
 
-            //     std::vector<uint8_t> h_vec(bytesPerVec);
-            //     std::vector<float> h_query(dim, 0.0f);
+                std::vector<uint8_t> h_vec(bytesPerVec);
+                std::vector<float> h_query(dim, 0.0f);
 
-            //     cudaMemcpy(
-            //         h_vec.data(),
-            //         reinterpret_cast<uint8_t*>(d_QuantizedVectorSet) + static_cast<size_t>(vid0) * bytesPerVec,
-            //         bytesPerVec,
-            //         cudaMemcpyDeviceToHost
-            //     );
+                cudaMemcpy(
+                    h_vec.data(),
+                    reinterpret_cast<uint8_t*>(d_QuantizedVectorSet) + static_cast<size_t>(vid0) * bytesPerVec,
+                    bytesPerVec,
+                    cudaMemcpyDeviceToHost
+                );
 
-            //     cudaMemcpy(
-            //         h_query.data(),
-            //         d_rotated_query,
-            //         sizeof(float) * dim,
-            //         cudaMemcpyDeviceToHost
-            //     );
+                cudaMemcpy(
+                    h_query.data(),
+                    d_rotated_query,
+                    sizeof(float) * dim,
+                    cudaMemcpyDeviceToHost
+                );
 
-            //     const float* meta = reinterpret_cast<const float*>(h_vec.data()); // [0]=f_add [1]=f_rescale [2]=f_error
-            //     const uint8_t* code = h_vec.data() + metaBytes;
+                const float* meta = reinterpret_cast<const float*>(h_vec.data()); // [0]=f_add [1]=f_rescale [2]=f_error
+                const uint8_t* code = h_vec.data() + metaBytes;
 
-            //     auto ipFunc = rabitqlib::select_excode_ipfunc(bits_per_code);
+                auto ipFunc = rabitqlib::select_excode_ipfunc(bits_per_code);
 
-            //     float est_lib = rabitqlib::quant::full_est_dist<float, uint8_t>(
-            //         code,
-            //         h_query.data(),
-            //         ipFunc,
-            //         dim,
-            //         bits_per_code,
-            //         meta[0],      // f_add
-            //         meta[1],      // f_rescale
-            //         g_add,
-            //         k1xsumq
-            //     );
+                float est_lib = rabitqlib::quant::full_est_dist<float, uint8_t>(
+                    code,
+                    h_query.data(),
+                    ipFunc,
+                    dim,
+                    bits_per_code,
+                    meta[0],      // f_add
+                    meta[1],      // f_rescale
+                    g_add,
+                    k1xsumq
+                );
 
-            //     float low_lib = est_lib - meta[2] * g_error;
-            //     float est_gpu = h_dist_temp[0];
+                float low_lib = est_lib - meta[2] * g_error;
+                float est_gpu = h_dist_temp[0];
 
-            //     SPTAGLIB_LOG(
-            //         Helper::LogLevel::LL_Info,
-            //         "TEST CPUvsGPU: vid=%d gpu_est=%f lib_est=%f diff=%f lib_low=%f limit=%f\n",
-            //         vid0, est_gpu, est_lib, std::abs(est_gpu - est_lib), low_lib, limitDist
-            //     );
-            // }
+                SPTAGLIB_LOG(
+                    Helper::LogLevel::LL_Info,
+                    "TEST CPUvsGPU: vid=%d gpu_est=%f lib_est=%f diff=%f lib_low=%f limit=%f\n",
+                    vid0, est_gpu, est_lib, std::abs(est_gpu - est_lib), low_lib, limitDist
+                );
+            }
             ///////////////////////////////////////////////////////////////////////////////////
 
+            // 测试
+            int addPointSuccess = 0;
+            // std::cout << "worstDist = " << queryResults->worstDist() << ", h_dist_temp[0] = " << h_dist_temp[0] << std::endl;
             for (int i = 0; i < numVector; i++)
             {
                 // 核心剪枝验证：GPU 端的 ProcessRaBitQ 若检测到 lowerBound > limitDist, 
                 // 会将其赋值为大于 1e30f 的无穷大值。CPU 在这里直接过滤它，保护 SSD IO。
                 if (h_dist_temp[i] < 1e30f) 
                 {
-                    queryResults->AddPoint(vectorIDs[i], h_dist_temp[i]);
+                    if(queryResults->AddPoint(vectorIDs[i], h_dist_temp[i]))
+                        addPointSuccess++;
                 }
             }
+            // std::cout << "TEST : AddPoint success count: " << addPointSuccess << std::endl;
             
             // 最终排完序后的前几百个（由 resultNum 控制），才会被放去 SSD 触发 Rerank。
             queryResults->SortResult();     // 升序
@@ -1240,31 +1253,53 @@ namespace SPTAG
         ErrorCode Index<T>::RerankFullVectorFusion(QueryResult &p_query, std::shared_ptr<VectorSet> vectorSet, int threadOrder, SearchStats* p_stats) const
         {
             // 测试
-            // std::cout << "TEST : RerankFullVectorFusion is called." << std::endl;
+            static std::atomic<int> s_debug_one_req{0};
+            bool debugThisReq = (s_debug_one_req.fetch_add(1, std::memory_order_relaxed) == 0);
             // 1) 结果容器与查询向量
             COMMON::QueryResultSet<T> *queryResults = (COMMON::QueryResultSet<T> *)&p_query;
             const T* targetVector = reinterpret_cast<const T *>(queryResults->GetTarget());
+            // 2) 关键IO优化：按 posting 去重请求
+            // key: posting id (m_vectorMapPosting[result->VID])
+            // value: 一个 AsyncReadRequest（同一 posting 只读一次）
             std::unordered_map<int64_t, Helper::AsyncReadRequest> uniqueRequests;
 
             Helper::AsyncFileIO* handler = (Helper::AsyncFileIO* )(m_indexFiles[0].get());
 
+            // 测试
+            if (debugThisReq)
+            {
+                int invalidCandidateCount1 = 0;
+                int invalidCandidateCount2 = 0;
+                for(int i = 0; i < queryResults->GetResultNum(); i++) {
+                    auto result = queryResults->GetResult(i);
+                    if (result->VID < 0 ) invalidCandidateCount1++;
+                    else if (m_vectorMapPosting[result->VID] < 0) invalidCandidateCount2++;
+                }
+                std::cout << "invalidCandidateCount1: " << invalidCandidateCount1 << " invalidCandidateCount2: " << invalidCandidateCount2 << std::endl;
+            }
+
             int pageCount = 0;
             int* pageCountref = &pageCount;
             // 遍历前 m_resultNum 个候选
+            // 3) 只处理前 m_resultNum 个候选做 rerank
             for (int j = 0; j < m_options.m_resultNum; j++) {
                 auto result = queryResults->GetResult(j);
+                // 非法候选跳过
                 if (result->VID < 0 || m_vectorMapPosting[result->VID] < 0)
                 {
                     continue;
                 }
 
+                // 3.1) 内存可读区：直接算精确距离，不发磁盘IO
                 if (result->VID < m_totalDocumentCount * m_options.m_readRatio) {
                     result->Dist = COMMON::DistanceUtils::ComputeDistance(targetVector, reinterpret_cast<const T *>(vectorSet->GetVector(result->VID)), m_options.m_dim, m_options.m_distCalcMethod);
                 }else{
+                    // 3.2) 需要磁盘：按 posting list 发请求（而不是按单个向量发请求）
                     const ListInfo* listInfo = &(m_listInfos[m_vectorMapPosting[result->VID]]);
                     int64_t listOffset = listInfo->listOffset;
                     int readSize = listInfo->listPageCount * m_pageSize;
 
+                    // 同一 posting 仅创建一次请求，避免重复IO
                     if (uniqueRequests.find(m_vectorMapPosting[result->VID]) == uniqueRequests.end()) {
                         // Create a new read request
                         char* buffer_ptr = nullptr;
@@ -1278,6 +1313,25 @@ namespace SPTAG
                         request.m_status = threadOrder;
                         request.m_success = false;
 
+                        // // 测试
+                        // if (debugThisReq) {
+                        //     SPTAGLIB_LOG(
+                        //         Helper::LogLevel::LL_Info,
+                        //         "RERANK_DEBUG_ONE_REQ: qTopJ=%d vid=%d posting=%d listOffset=%lld readSize=%d listEleCount=%u listPageCount=%u pageOffset=%u\n",
+                        //         j,
+                        //         (int)result->VID,
+                        //         (int)m_vectorMapPosting[result->VID],
+                        //         (long long)listOffset,
+                        //         readSize,
+                        //         (unsigned)listInfo->listEleCount,
+                        //         (unsigned)listInfo->listPageCount,
+                        //         (unsigned)listInfo->pageOffset
+                        //     );
+                        // }
+                        ////////////////////////////////////////////////////////
+
+                        // 回调：该 posting 数据读回后，扫描 list 中每个向量
+                        // 如果向量ID命中 queryResults 里的某个候选，就重算其精确距离
                         request.m_callback = [request, queryResults, targetVector, listInfo, pageCountref, this](bool success)
                         {
                             char* postingListFullData = request.m_buffer + listInfo->pageOffset;
@@ -1285,6 +1339,7 @@ namespace SPTAG
                             for (size_t i = 0; i < listInfo->listEleCount; i++)
                             {
                                 int vectorID = *(reinterpret_cast<int*>(postingListFullData + m_vectorInfoSize * i));
+                                // 线性扫描当前结果池，把命中的候选更新成精确距离
                                 for (int j = 0; j < queryResults->GetResultNum(); j++) {
                                     auto result = queryResults->GetResult(j);
                                     if (vectorID == result->VID) {
@@ -1300,11 +1355,13 @@ namespace SPTAG
                 }
             }
 
+            // 4) 把去重后的请求收集成线性数组，供 io_submit 使用
             std::vector<Helper::AsyncReadRequest> diskRequests;
             for (auto& pair : uniqueRequests) {
                 diskRequests.push_back(std::move(pair.second));
             }
 
+            // 5) Linux AIO 准备
             size_t num = diskRequests.size();
             struct timespec AIOTimeout = {0, 30000};
             std::vector<struct iocb> myiocbs(num);
@@ -1330,6 +1387,7 @@ namespace SPTAG
                 iocbs.emplace_back(myiocb);
             }
 
+            // 6) 两种模式：批处理 rerank 或普通模式
             if(m_options.m_rerank_batch){
                 int batchSize = m_options.m_rerank_batchSize;
                 int heapExpandSize = m_options.m_rerank + 8;
@@ -1342,6 +1400,7 @@ namespace SPTAG
                     int batchStartIdx = done;
                     int batchEndIdx = std::min(done + batchSize, totalToSubmit); // 璁＄畻褰撳墠鎵规鐨勭粨鏉熶綅缃?
                     int totalBatchSize = batchEndIdx - batchStartIdx;
+                    // 6.1) 提交一批IO并等待
                     while (totalDone < totalBatchSize) {
                         if (totalSubmitted < totalBatchSize) {
                             if (submitted < iocbs.size()) {
@@ -1356,6 +1415,7 @@ namespace SPTAG
                             }
                         }
 
+                        // 6.2) 对已完成事件执行回调，更新候选距离
                         for (int i = totalQueued; i < totalDone; i++) {
                             Helper::AsyncReadRequest* req = reinterpret_cast<Helper::AsyncReadRequest*>((events[i].data));
                             if (nullptr != req)
@@ -1373,6 +1433,7 @@ namespace SPTAG
                         }
                     }
 
+                    // 6.3) 批次收尾回调
                     for (int i = totalQueued; i < totalDone; i++) {
                         Helper::AsyncReadRequest* req = reinterpret_cast<Helper::AsyncReadRequest*>((events[i].data));
                         if (nullptr != req)
@@ -1381,6 +1442,7 @@ namespace SPTAG
                         }
                     }
 
+                    // 6.4) 根据 topK 变化率自适应调整 batchSize，减少无效IO
                     float changeRate = 1.0 * queryResults->IsHeapUnchanged(heapExpandSize) / (2 * heapExpandSize);
                     if(changeRate == 0){
                         changeNum ++;
@@ -1399,7 +1461,7 @@ namespace SPTAG
                     //     changeNum = 0;
                     // }
                 }
-            }else{
+            }else{  // 普通模式：一次性提交剩余IO并处理回调
                  std::vector<struct io_event> events(totalToSubmit);
                 int totalDone = 0, totalSubmitted = 0, totalQueued = 0;
                 while (totalDone < totalToSubmit) {
@@ -1442,6 +1504,7 @@ namespace SPTAG
                 }
             }
 
+            // 7) 统计与最终排序
             p_stats->m_diskAccessCount = pageCount;
             p_stats->m_diskIOCount = done;
             SPTAG::BasicResult* re = queryResults->GetResults();

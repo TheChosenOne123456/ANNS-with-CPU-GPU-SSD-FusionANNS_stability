@@ -799,8 +799,8 @@ BOOST_AUTO_TEST_CASE(RaBitQ_vs_Uint8_Kernel_Benchmark)
 BOOST_AUTO_TEST_CASE(RaBitQ_RealData_EstimateVsTrue)
 {
     const std::string root = "/home/ANNS_SSD/tyh/SIFT1B_data/";
-    const std::string quantizerPath = root + "1bit_rabitq_quantizer";
-    const std::string codePath = root + "base_1bit_rabitq.1B.u8bin";
+    const std::string quantizerPath = root + "2bits_rabitq_quantizer";
+    const std::string codePath = root + "base_2bits_rabitq.1B.u8bin";
     const std::string basePath = root + "base.1B.u8bin";
 
     const int Q = 10000; // 查询向量数（外层）
@@ -868,6 +868,7 @@ BOOST_AUTO_TEST_CASE(RaBitQ_RealData_EstimateVsTrue)
     double sumErrorBoundOverEst = 0.0;  // errorBound在est中的比例
     uint64_t violations_below_lower = 0;
     uint64_t violations_above_upper = 0;
+    uint64_t very_large_error_cases = 0;
 
     const float EPS = 1e-6f;
 
@@ -923,14 +924,23 @@ BOOST_AUTO_TEST_CASE(RaBitQ_RealData_EstimateVsTrue)
 
                 float est = estimates[ki];
                 float lowBound = lowBounds[ki];
-                lowBound = 2 * lowBound - est; // 临时降低，改为两个errorBound
+                // lowBound = 2 * lowBound - est; // 临时降低，改为两个errorBound
                 float errorBound = est - lowBound;
+                // std::cout << "Est=" << est << ", LowBound=" << lowBound
+                //           << ", ErrorBound=" << errorBound << std::endl;
                 float boundRatio = (est > 1e-6f) ? (errorBound / est) : 0.0f;
                 sumErrorBoundOverEst += boundRatio;
+                // if(boundRatio >= 1.0) {
+                //     std::cout << "Fuck you High bound ratio: " << boundRatio << ", Est=" << est << ", LowBound=" << lowBound << ", TrueDist = " << trueDist << std::endl;
+                // }
+                if(trueDist <= 8000.0 && trueDist > 0.0) {
+                    std::cout << "small dist : " << "Est=" << est << ", LowBound=" << lowBound << ", TrueDist = " << trueDist << std::endl;
+                }
                 float upperBound = est + errorBound; // 对称近似上界用于检验是否存在上界
 
                 if (trueDist + 1e-6f < lowBound) ++violations_below_lower;
                 if (trueDist > upperBound + 1e-6f) ++violations_above_upper;
+                if (est / trueDist > 8.0f) ++very_large_error_cases;
 
                 float rel = (trueDist > EPS) ? (std::abs(est - trueDist) / trueDist) : 0.0f;
                 sumRelErr += std::min(rel, 1.0f);
@@ -990,7 +1000,7 @@ BOOST_AUTO_TEST_CASE(RaBitQ_RealData_EstimateVsTrue)
 
                 float est = estimates[ki];
                 float lowBound = lowBounds[ki];
-                lowBound = 2 * lowBound - est; // 临时降低，改为两个errorBound
+                // lowBound = 2 * lowBound - est; // 临时降低，改为两个errorBound
                 float errorBound = est - lowBound;
                 float boundRatio = (est > 1e-6f) ? (errorBound / est) : 0.0f;
                 sumErrorBoundOverEst += boundRatio;
@@ -998,6 +1008,7 @@ BOOST_AUTO_TEST_CASE(RaBitQ_RealData_EstimateVsTrue)
 
                 if (trueDist + 1e-6f < lowBound) ++violations_below_lower;
                 if (trueDist > upperBound + 1e-6f) ++violations_above_upper;
+                if (est / trueDist > 8.0f) ++very_large_error_cases;
 
                 float rel = (trueDist > EPS) ? (std::abs(est - trueDist) / trueDist) : 0.0f;
                 sumRelErr += std::min(rel, 1.0f);
@@ -1022,6 +1033,7 @@ BOOST_AUTO_TEST_CASE(RaBitQ_RealData_EstimateVsTrue)
     std::cout << "Total comparisons: " << totalComparisons << std::endl;
     std::cout << "Violations below lower bound: " << violations_below_lower << std::endl;
     std::cout << "Violations above upper bound: " << violations_above_upper << std::endl;
+    std::cout << "very large error cases: " << very_large_error_cases << std::endl;
     std::cout << "Violations (sum): " << countViolations << std::endl;
     std::cout << "Average errorBound/est ratio: " << avgErrorBoundRatio << std::endl;
     std::cout << "Average relative error (capped at 1): " << avgRelErr << std::endl;

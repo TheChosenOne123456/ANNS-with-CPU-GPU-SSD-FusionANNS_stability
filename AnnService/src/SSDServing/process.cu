@@ -321,7 +321,8 @@ __global__ void ProcessRaBitQ(
                 // 我们直接标记其距离为 3e38f，后续 CPU 收到就会丢弃它
                 d_dist[idx] = 3e38f; 
             } else {
-                d_dist[idx] = estimateDist;
+                // d_dist[idx] = estimateDist;
+                d_dist[idx] = fmaxf(low_dist, 0.0f); // 先用 lower bound 作为入堆分数
             }
         }
         else 

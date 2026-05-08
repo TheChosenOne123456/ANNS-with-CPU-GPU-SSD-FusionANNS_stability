@@ -187,12 +187,16 @@ namespace SPTAG
                                 // 利用重排序索引加速的混合重排
                                 if (p_opts.m_rerank > 0 && p_opts.m_resultNum > 0) 
                                 {
+                                    // 测试
+                                    // std::cout << "TEST : RerankFullVectorFusion is callded" << std::endl;
                                     p_index->RerankFullVectorFusion(p_results[index], rerankVectorSet, i, &(p_stats[index]));
                                 }
                             }else{
                                 // 标准重排序：用原始向量精确计算 top 候选的距离
                                 if (p_opts.m_rerank > 0 && p_opts.m_resultNum > 0) 
                                 {
+                                    // 测试
+                                    // std::cout << "TEST : RerankFullVector is callded" << std::endl;
                                     p_index->RerankFullVector(p_results[index], rerankVectorSet, i, postingIDSet, &(p_stats[index]));
                                 }
                             }
@@ -396,10 +400,14 @@ namespace SPTAG
                                     SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "TEST : C m_rerank = %d, m_resultNum = %d\n", p_opts.m_rerank, p_opts.m_resultNum);
                                 if (p_opts.m_enableReorderIndex) {
                                     if (p_opts.m_rerank > 0 && p_opts.m_resultNum > 0) {
+                                        if((index & ((1 << 14) - 1)) == 0)
+                                            std::cout << "TEST : RerankFullVectorFusion is callded" << std::endl;
                                         p_index->RerankFullVectorFusion(p_results[index], rerankVectorSet, i, &(p_stats[index]));
                                     }
                                 } else {
                                     if (p_opts.m_rerank > 0 && p_opts.m_resultNum > 0) {
+                                        if((index & ((1 << 14) - 1)) == 0)
+                                            std::cout << "TEST : RerankFullVector is callded" << std::endl;
                                         p_index->RerankFullVector(p_results[index], rerankVectorSet, i, postingIDSet, &(p_stats[index]));
                                     }
                                 }
@@ -472,6 +480,7 @@ namespace SPTAG
                     return;
                 }
                 ptr_vector->ReadBinary(sizeof(count), reinterpret_cast<char *>(&(count)));
+                ptr_vector->ReadBinary(sizeof(dim), reinterpret_cast<char *>(&(dim)));
                 ///////////////////////////////////////////////////////////////////////////////////
                 // 这里的dim是字节数！！！原作者是有点阴在身上的
                 ///////////////////////////////////////////////////////////////////////////////////                ptr_vector->ReadBinary(sizeof(dim), reinterpret_cast<char *>(&(dim)));
