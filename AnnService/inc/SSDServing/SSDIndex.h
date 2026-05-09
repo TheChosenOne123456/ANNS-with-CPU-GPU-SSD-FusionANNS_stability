@@ -486,7 +486,7 @@ namespace SPTAG
                 ///////////////////////////////////////////////////////////////////////////////////                ptr_vector->ReadBinary(sizeof(dim), reinterpret_cast<char *>(&(dim)));
                 // std::cout << "TEST : quantizer vector count = " << count << ", dim = " << dim << std::endl;
                 std::shared_ptr<VectorSet> QuantizedVectorSet;
-                void *d_QuantizedVectorSet;    // d_表示device，GPU端通常称为device，CPU端通常称为host
+                void *d_QuantizedVectorSet = nullptr;    // d_表示device，GPU端通常称为device，CPU端通常称为host
                 // std::cout << "TEST : begin loading quantized vector" << std::endl;
                 if (!QuantizervectorFilePath.empty() && fileexists(QuantizervectorFilePath.c_str()))
                 {
@@ -550,8 +550,32 @@ namespace SPTAG
                             std::memcpy(dstVec + gpuMetaBytes, srcVec + cpuMetaBytes, codeBytes);
                         }
 
-                        cudaMalloc((void **)&d_QuantizedVectorSet, gpuTotalBytes);
-                        cudaMemcpy(d_QuantizedVectorSet, compactBuffer.data(), gpuTotalBytes, cudaMemcpyHostToDevice);
+                        if(gpuTotalBytes <= (32ull << 30)) // 如果不超过 32GB，警告用户并改用分块预取策略
+                        {
+                            std::cout << "TEST : GPU available" << std::endl;
+                            cudaMalloc((void **)&d_QuantizedVectorSet, gpuTotalBytes);
+                            cudaMemcpy(d_QuantizedVectorSet, compactBuffer.data(), gpuTotalBytes, cudaMemcpyHostToDevice);
+                        }
+                        // cudaMalloc((void **)&d_QuantizedVectorSet, gpuTotalBytes);
+                        // cudaMemcpy(d_QuantizedVectorSet, compactBuffer.data(), gpuTotalBytes, cudaMemcpyHostToDevice);
+                        else
+                        {
+                            std::cout << "TEST : GPU not enough" << std::endl;
+                            // --- 改为 Unified Managed Memory + 分块 prefetch ---
+                            cudaMallocManaged(&d_QuantizedVectorSet, gpuTotalBytes);
+                            std::memcpy(d_QuantizedVectorSet, compactBuffer.data(), gpuTotalBytes);
+
+                            // 标注为只读（有助于驱动优化）
+                            int device = 0;
+                            cudaGetDevice(&device);
+                            cudaMemAdvise(d_QuantizedVectorSet, gpuTotalBytes, cudaMemAdviseSetReadMostly, device);
+
+                            // 只 prefetch 首个块到 GPU（例如 4GB），不要在初始化阶段 prefetch 全部
+                            size_t initialPrefetch = std::min((size_t)(22ull << 30), gpuTotalBytes); // 4GB 或更小
+                            cudaMemPrefetchAsync((char*)d_QuantizedVectorSet, initialPrefetch, device, 0);
+                            // 等待预取完成（或在后续 kernel 前 prefetch 并在相同 stream 上同步）
+                            cudaDeviceSynchronize();
+                        }
                     }
                     else
                     {
