@@ -203,7 +203,9 @@ namespace SPTAG
 
                 // 论文式 lower bound（保守剪枝）
                 if (out_low_dist != nullptr) {
-                    *out_low_dist = est - meta->f_error * bond_meta.g_error;
+                    const float err_scale = static_cast<float>(1u << static_cast<unsigned>(m_BitsPerCode - 1));
+                    float low = est - (meta->f_error * bond_meta.g_error) / err_scale;
+                    *out_low_dist = std::max(0.0f, low);
                 }
 
                 return est;
@@ -238,7 +240,9 @@ namespace SPTAG
 
                 // 论文式 lower bound（保守剪枝）
                 if (out_low_dist != nullptr) {
-                    *out_low_dist = est - meta->f_error * g_error;
+                    const float err_scale = static_cast<float>(1u << static_cast<unsigned>(m_BitsPerCode - 1));
+                    float low = est - (meta->f_error * g_error) / err_scale;
+                    *out_low_dist = std::max(0.0f, low);
                 }
 
                 return est;
