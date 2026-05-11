@@ -202,6 +202,41 @@ void processFunction1(void *d_PQVectorSet, int *d_vectorIDs, void *d_table, std:
 }
 
 // 在 GPU 上实现标量的 Bit 解压和向量跟 Float 内积的计算引擎
+__device__ __forceinline__ uint8_t decode_rabitq_code_at(
+    const uint8_t* code, int dim_idx, int bits_per_code)
+{
+    const int blk = dim_idx >> 4;   // 每 16 维一个打包块
+    const int lane = dim_idx & 15;
+
+    if (bits_per_code == 8) {
+        return code[dim_idx];
+    }
+    if (bits_per_code == 4) {
+        // 16x4bit -> uint64，布局对齐 CPU UnpackVector
+        const uint64_t pack = reinterpret_cast<const uint64_t*>(code)[blk];
+        const int half = lane >> 3;        // 0:前8维, 1:后8维
+        const int byte = lane & 7;
+        const int shift = byte * 8 + half * 4;
+        return static_cast<uint8_t>((pack >> shift) & 0x0F);
+    }
+    if (bits_per_code == 2) {
+        // 16x2bit -> uint32，布局对齐 CPU UnpackVector
+        const uint32_t pack = reinterpret_cast<const uint32_t*>(code)[blk];
+        const int group = lane >> 2;       // 0..3, 对应位平面 0/2/4/6
+        const int byte = lane & 3;
+        const int shift = byte * 8 + group * 2;
+        return static_cast<uint8_t>((pack >> shift) & 0x03);
+    }
+    if (bits_per_code == 1) {
+        // 16x1bit -> uint16
+        const uint16_t pack = reinterpret_cast<const uint16_t*>(code)[blk];
+        return static_cast<uint8_t>((pack >> lane) & 0x01);
+    }
+
+    // 防御分支，正常不会走到
+    return 0;
+}
+
 __device__ float cuda_rabitq_inner_product(
     const float* d_query, 
     const uint8_t* d_code, 
@@ -209,25 +244,9 @@ __device__ float cuda_rabitq_inner_product(
     int bits_per_code)
 {
     float ip = 0.0f;
-    int elements_per_byte = 8 / bits_per_code;
-    int mask = (1 << bits_per_code) - 1;
-
-    // // GPU 的一个优化技巧是可以将 4 个 bytes 组合成 uint32_t 进行更快的内存读取，
-    // // 但为了代码通用并匹配你原本的数据结构，我们按照 Byte 粒度解包。
-    int byte_idx = 0;
-    int shift = 0;
-
-    for (int i = 0; i < dim; i++) {
-        // 提取解包位
-        uint8_t val = (d_code[byte_idx] >> shift) & mask;
-        ip += d_query[i] * static_cast<float>(val);
-
-        // 步进
-        shift += bits_per_code;
-        if (shift >= 8) {
-            shift = 0;
-            byte_idx++;
-        }
+    for (int i = 0; i < dim; ++i) {
+        const uint8_t q = decode_rabitq_code_at(d_code, i, bits_per_code);
+        ip += d_query[i] * static_cast<float>(q);
     }
     return ip;
 }
@@ -243,12 +262,14 @@ __device__ float cuda_rabitq_full_est_dist(
     float g_add, 
     float k1xsumq)
 {
-    // 利用我们写的内部拆包函数做内积：IP(q, c)
-    float ip = cuda_rabitq_inner_product(d_query, d_code, dim, bits_per_code);
+    const float ip = cuda_rabitq_inner_product(d_query, d_code, dim, bits_per_code);
 
-    // 原封不动复刻论文论文中的 full_est 计算：
-    // std::sqrt(g_add + meta->f_add + k1xsumq + meta->f_rescale * ip)
-    float inner_val = g_add + f_add + k1xsumq + f_rescale * ip;
+    // 与 CPU 标准实现对齐：
+    // est = g_add + f_add + f_rescale * (ip + k1xsumq * ((1<<bits)-1))
+    const float k = static_cast<float>((1 << bits_per_code) - 1);
+    const float inner_val = g_add + f_add + f_rescale * (ip + k1xsumq * k);
+
+    // 所有距离都按平方距离处理，不做 sqrt
     return (inner_val > 0.0f) ? inner_val : 0.0f; 
 }
 
@@ -313,7 +334,8 @@ __global__ void ProcessRaBitQ(
             );
 
             // 2. 计算误差下限 (用于保守剪枝)
-            float low_dist = estimateDist - (f_error * bond_meta.g_error);
+            const float err_scale = static_cast<float>(1u << static_cast<unsigned>(bits_per_code - 1));
+            float low_dist = estimateDist - (f_error * bond_meta.g_error) / err_scale;
 
             // 3. 剪枝策略！这是融合进 GPU 的精髓。
             if (low_dist > limitDist) {
@@ -321,8 +343,8 @@ __global__ void ProcessRaBitQ(
                 // 我们直接标记其距离为 3e38f，后续 CPU 收到就会丢弃它
                 d_dist[idx] = 3e38f; 
             } else {
-                // d_dist[idx] = estimateDist;
-                d_dist[idx] = fmaxf(low_dist, 0.0f); // 先用 lower bound 作为入堆分数
+                d_dist[idx] = estimateDist;
+                // d_dist[idx] = fmaxf(low_dist, 0.0f); // 先用 lower bound 作为入堆分数
             }
         }
         else 

@@ -798,10 +798,10 @@ BOOST_AUTO_TEST_CASE(RaBitQ_vs_Uint8_Kernel_Benchmark)
 
 BOOST_AUTO_TEST_CASE(RaBitQ_RealData_EstimateVsTrue)
 {
-    const std::string root = "/home/ANNS_SSD/tyh/SIFT1B_data/";
-    const std::string quantizerPath = root + "2bits_rabitq_quantizer";
-    const std::string codePath = root + "base_2bits_rabitq.1B.u8bin";
-    const std::string basePath = root + "base.1B.u8bin";
+    const std::string root = "/home/ANNS_SSD/tyh/SIFT100M_data/";
+    const std::string quantizerPath = root + "8bits_rabitq_quantizer.100M";
+    const std::string codePath = root + "learn_8bits_rabitq.100M.u8bin";
+    const std::string basePath = root + "learn.100M.u8bin";
 
     const int Q = 10000; // 查询向量数（外层）
     const int K = 10000; // 每次查询随机比较的量化向量数（内层）
@@ -930,9 +930,6 @@ BOOST_AUTO_TEST_CASE(RaBitQ_RealData_EstimateVsTrue)
                 //           << ", ErrorBound=" << errorBound << std::endl;
                 float boundRatio = (est > 1e-6f) ? (errorBound / est) : 0.0f;
                 sumErrorBoundOverEst += boundRatio;
-                // if(boundRatio >= 1.0) {
-                //     std::cout << "Fuck you High bound ratio: " << boundRatio << ", Est=" << est << ", LowBound=" << lowBound << ", TrueDist = " << trueDist << std::endl;
-                // }
                 if(trueDist <= 8000.0 && trueDist > 0.0) {
                     std::cout << "small dist : " << "Est=" << est << ", LowBound=" << lowBound << ", TrueDist = " << trueDist << std::endl;
                 }
@@ -940,7 +937,7 @@ BOOST_AUTO_TEST_CASE(RaBitQ_RealData_EstimateVsTrue)
 
                 if (trueDist + 1e-6f < lowBound) ++violations_below_lower;
                 if (trueDist > upperBound + 1e-6f) ++violations_above_upper;
-                if (est / trueDist > 8.0f) ++very_large_error_cases;
+                if ((est / trueDist > 8.0f) && (trueDist > 0)) ++very_large_error_cases;
 
                 float rel = (trueDist > EPS) ? (std::abs(est - trueDist) / trueDist) : 0.0f;
                 sumRelErr += std::min(rel, 1.0f);
@@ -1008,7 +1005,7 @@ BOOST_AUTO_TEST_CASE(RaBitQ_RealData_EstimateVsTrue)
 
                 if (trueDist + 1e-6f < lowBound) ++violations_below_lower;
                 if (trueDist > upperBound + 1e-6f) ++violations_above_upper;
-                if (est / trueDist > 8.0f) ++very_large_error_cases;
+                if ((est / trueDist > 8.0f) && (trueDist > 0)) ++very_large_error_cases;
 
                 float rel = (trueDist > EPS) ? (std::abs(est - trueDist) / trueDist) : 0.0f;
                 sumRelErr += std::min(rel, 1.0f);

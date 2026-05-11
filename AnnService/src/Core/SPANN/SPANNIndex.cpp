@@ -780,7 +780,7 @@ namespace SPTAG
 
             // ∞ÂøÈ 5£∫æ‡¿Î∞Û∂®”Î◊Ó÷’≈≈–Ú
             // ≤‚ ‘
-            std::cout << "worstDist = " << queryResults->worstDist() << ", h_dist_temp[0] = " << h_dist_temp[0] << std::endl;
+            // std::cout << "worstDist = " << queryResults->worstDist() << ", h_dist_temp[0] = " << h_dist_temp[0] << std::endl;
             int addPointSuccess = 0;
             for (int i = 0; i < numVector; i++){
                 if(queryResults->AddPoint(vectorIDs[i], h_dist_temp[i]) == true){
@@ -981,7 +981,8 @@ namespace SPTAG
                     k1xsumq
                 );
 
-                float low_lib = est_lib - meta[2] * g_error;
+                const float err_scale = static_cast<float>(1u << static_cast<unsigned>(bits_per_code - 1));
+                const float low_lib = std::max(0.0f, est_lib - (meta[2] * g_error) / err_scale);
                 float est_gpu = h_dist_temp[0];
 
                 SPTAGLIB_LOG(

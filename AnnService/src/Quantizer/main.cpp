@@ -213,6 +213,7 @@ int main(int argc, char* argv[])
                     auto rq = std::make_shared<COMMON::RaBitQQuantizer<std::uint8_t>>(options->m_dimension);
                     if (options->m_quantizedDim > 0) rq->SetBitsPerCode((SizeType)options->m_quantizedDim);
                     rq->Train(set->GetData(), set->Count(), true);
+                    std::cout << "TEST : setSize = " << set->Count() << std::endl;
                     quantizer = rq;
                     break;
                 }
