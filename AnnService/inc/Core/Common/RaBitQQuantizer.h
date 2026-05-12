@@ -65,7 +65,7 @@ namespace SPTAG
                   m_RotatorType(RotatorStorageType::FhtKac),
                   m_FormatVersion(PersistVersion::V2),
                   m_hasCentroid(0),
-                  m_Centroid(nullptr)
+                  m_rotCentroid(nullptr)
             {
             }
 
@@ -134,6 +134,8 @@ namespace SPTAG
                 float f_add;
                 float f_rescale;
                 float f_error;
+                std::uint8_t centroid_id;
+                // std::uint8_t _reserved[3]; // 维持 4-byte 对齐
             };
 
             // 查询向量的元信息，和理论误差界限的计算相关
@@ -183,15 +185,24 @@ namespace SPTAG
                 const auto* meta = reinterpret_cast<const RaBitQEstimateMeta*>(pY);
                 const uint8_t* code = reinterpret_cast<const uint8_t*>(pY + m_MetaSize);
 
-                // float g_add = 0.0f;
-                // float k1xsumq = 0.0f;
-                // float g_error = 0.0f;
+                std::vector<float> centered_query;
+                const float* qptr = rotated_query;
+
+                if (m_hasCentroid > 0 && m_rotCentroid != nullptr && meta->centroid_id < m_hasCentroid) {
+                    centered_query.resize(m_PaddedDim);
+                    const float* cc = m_rotCentroid->data() + static_cast<size_t>(meta->centroid_id) * m_PaddedDim;
+                    for (DimensionType i = 0; i < m_PaddedDim; ++i) {
+                        centered_query[i] = rotated_query[i] - cc[i];
+                    }
+                    qptr = centered_query.data();
+                }
+
                 BondMeta bond_meta;
-                BuildL2EstimateQueryFactors(rotated_query, bond_meta);
+                BuildL2EstimateQueryFactors(qptr, bond_meta);
 
                 float est = rabitqlib::quant::full_est_dist<float, uint8_t>(
                     code,
-                    rotated_query,
+                    qptr,
                     m_PackedIpFunc, // 使用位压缩专用 SIMD 内核替换普通的 IPFloatU8
                     m_PaddedDim,
                     m_BitsPerCode,
@@ -211,7 +222,7 @@ namespace SPTAG
                 return est;
             }
 
-            // 重载，额外接收查询元信息以避免重复计算（建议使用）
+            // 重载，额外接收查询元信息以避免重复计算（多质心下废弃）
             inline float L2DistanceEstimate(
                 const float* rotated_query,
                 const std::uint8_t* pY,
@@ -219,37 +230,39 @@ namespace SPTAG
                 float* out_low_dist = nullptr
             ) const
             {
-                const auto* meta = reinterpret_cast<const RaBitQEstimateMeta*>(pY);
-                const uint8_t* code = reinterpret_cast<const uint8_t*>(pY + m_MetaSize);
+                // 兼容 不建议使用了
+                return L2DistanceEstimate(rotated_query, pY, out_low_dist);
+                // const auto* meta = reinterpret_cast<const RaBitQEstimateMeta*>(pY);
+                // const uint8_t* code = reinterpret_cast<const uint8_t*>(pY + m_MetaSize);
 
-                float g_add = bond_meta.g_add;
-                float k1xsumq = bond_meta.k1xsumq;
-                float g_error = bond_meta.g_error;
+                // float g_add = bond_meta.g_add;
+                // float k1xsumq = bond_meta.k1xsumq;
+                // float g_error = bond_meta.g_error;
 
-                float est = rabitqlib::quant::full_est_dist<float, uint8_t>(
-                    code,
-                    rotated_query,
-                    m_PackedIpFunc,
-                    m_PaddedDim,
-                    m_BitsPerCode,
-                    meta->f_add,
-                    meta->f_rescale,
-                    g_add,
-                    k1xsumq
-                );
+                // float est = rabitqlib::quant::full_est_dist<float, uint8_t>(
+                //     code,
+                //     rotated_query,
+                //     m_PackedIpFunc,
+                //     m_PaddedDim,
+                //     m_BitsPerCode,
+                //     meta->f_add,
+                //     meta->f_rescale,
+                //     g_add,
+                //     k1xsumq
+                // );
 
-                // 论文式 lower bound（保守剪枝）
-                if (out_low_dist != nullptr) {
-                    const float err_scale = static_cast<float>(1u << static_cast<unsigned>(m_BitsPerCode - 1));
-                    float low = est - (meta->f_error * g_error) / err_scale;
-                    *out_low_dist = std::max(0.0f, low);
-                }
+                // // 论文式 lower bound（保守剪枝）
+                // if (out_low_dist != nullptr) {
+                //     const float err_scale = static_cast<float>(1u << static_cast<unsigned>(m_BitsPerCode - 1));
+                //     float low = est - (meta->f_error * g_error) / err_scale;
+                //     *out_low_dist = std::max(0.0f, low);
+                // }
 
-                return est;
+                // return est;
             }
 
             // 训练阶段仅用于选择旋转器和更新尺寸
-            void Train(const void* data, SizeType num, bool useCentroid = false)
+            void Train(const void* data, SizeType num, std::uint8_t numCentroids = 0)
             {
                 if (!m_Rotator) {
                     if (m_RotatorType == RotatorStorageType::Matrix) {
@@ -261,53 +274,33 @@ namespace SPTAG
                             m_Dim, rabitqlib::RotatorType::FhtKacRotator
                         );
                     }
-                    // m_Rotator = rabitqlib::choose_rotator<float>(
-                    //         m_Dim, rabitqlib::RotatorType::FhtKacRotator
-                    //     );
                     RecalcSizes();
                 }
-                if (!useCentroid || data == nullptr || num == 0) {
-                    m_Centroid.reset();
+                if (data == nullptr || num == 0 || numCentroids == 0) {
+                    m_rotCentroid.reset();
                     m_hasCentroid = 0;
                     return;
                 }
 
-                m_hasCentroid = 1;
-                m_Centroid.reset(new std::vector<float>(m_Dim, 0.0f));
-                const T* p = reinterpret_cast<const T*>(data);
-
-                for (SizeType n = 0; n < num; ++n) {
-                    const T* v = p + static_cast<size_t>(n) * m_Dim;
-                    for (DimensionType d = 0; d < m_Dim; ++d) {
-                        (*m_Centroid)[d] += static_cast<float>(v[d]);
-                    }
-                }
-
-                const float inv = 1.0f / static_cast<float>(num);
-                for (DimensionType d = 0; d < m_Dim; ++d) {
-                    (*m_Centroid)[d] *= inv;
-                }
+                // 执行k-means聚类
+                RunKmeansRotCentroids(reinterpret_cast<const T*>(data), num, numCentroids);
             }
 
             // 将原始向量量化为指定码值并写入 meta 信息
             virtual void QuantizeVector(const void* vec, std::uint8_t* vecout, bool ADC = true) const
             {
                 (void)ADC;
-                std::vector<float> fvec(m_Dim);
-                ConvertInputToFloat(reinterpret_cast<const T*>(vec), fvec.data());
-
-                if (m_Centroid != nullptr && m_hasCentroid == 1) {
-                    // 减质心
-                    for (DimensionType i = 0; i < m_Dim; ++i) {
-                        fvec[i] -= (*m_Centroid)[i];
-                    }
-                }
-
                 std::vector<float> rotated_vec(m_PaddedDim, 0.0f);
-                if (m_Rotator) {
-                    m_Rotator->rotate(fvec.data(), rotated_vec.data());
-                } else {
-                    std::memcpy(rotated_vec.data(), fvec.data(), m_Dim * sizeof(float));
+                RotateInput(reinterpret_cast<const T*>(vec), rotated_vec.data());
+
+                // 找到最近的聚类中心并中心化
+                std::uint8_t cid = 0;
+                if (m_hasCentroid > 0 && m_rotCentroid != nullptr) {
+                    cid = SelectNearestCentroid(rotated_vec.data());
+                    const float* cc = m_rotCentroid->data() + static_cast<size_t>(cid) * m_PaddedDim;
+                    for (DimensionType i = 0; i < m_PaddedDim; ++i) {
+                        rotated_vec[i] -= cc[i];
+                    }
                 }
 
                 auto* meta = reinterpret_cast<RaBitQEstimateMeta*>(vecout);
@@ -351,6 +344,7 @@ namespace SPTAG
                     meta->f_add = f_add;
                     meta->f_rescale = f_rescale;
                     meta->f_error = f_error;
+                    meta->centroid_id = cid;
                     return;
                 }
 
@@ -398,6 +392,7 @@ namespace SPTAG
                 meta->f_add = f_add;
                 meta->f_rescale = f_rescale;
                 meta->f_error = f_error;
+                meta->centroid_id = cid;
             }
 
             // 将量化向量反量化重建为原始 float 向量
@@ -405,11 +400,11 @@ namespace SPTAG
             {
                 std::vector<float> rotated_reconst(m_PaddedDim);
 
-                const float* meta_ptr = reinterpret_cast<const float*>(qvec);
+                const auto* meta = reinterpret_cast<const RaBitQEstimateMeta*>(qvec);
                 const uint8_t* bin_ptr = reinterpret_cast<const uint8_t*>(qvec + m_MetaSize);
 
-                float delta = meta_ptr[0];
-                float vl = meta_ptr[1];
+                float delta = meta->delta;
+                float vl = meta->vl;
 
                 // 解压：先把紧凑存放的位数提取回一维一字节的格式进行后续常规重建
                 std::vector<uint8_t> raw_code(m_PaddedDim, 0);
@@ -423,6 +418,16 @@ namespace SPTAG
                     rotated_reconst.data()
                 );
 
+                if (m_hasCentroid > 0 && m_rotCentroid != nullptr) {
+                    std::uint8_t cid = meta->centroid_id;
+                    if (cid < m_hasCentroid) {
+                        const float* cc = m_rotCentroid->data() + static_cast<size_t>(cid) * m_PaddedDim;
+                        for (DimensionType i = 0; i < m_PaddedDim; ++i) {
+                            rotated_reconst[i] += cc[i];
+                        }
+                    }
+                }
+
                 std::vector<float> out_float(m_Dim, 0.0f);
                 if (m_Rotator) {
                     m_Rotator->rotate(rotated_reconst.data(), out_float.data());
@@ -430,14 +435,6 @@ namespace SPTAG
                     std::memcpy(out_float.data(), rotated_reconst.data(), m_Dim * sizeof(float));
                 }
 
-                // 如果启用了中心化，重建回原空间时需要把质心加回来
-                if (m_hasCentroid == 1 &&
-                    m_Centroid != nullptr &&
-                    m_Centroid->size() == static_cast<size_t>(m_Dim)) {
-                    for (DimensionType i = 0; i < m_Dim; ++i) {
-                        out_float[i] += (*m_Centroid)[i];
-                    }
-                }
 
                 // 重建结果的类型落地转换，uint8 版本需要做范围裁剪和四舍五入
                 if constexpr (std::is_same<T, float>::value) {
@@ -473,8 +470,8 @@ namespace SPTAG
                        sizeof(std::uint8_t) + sizeof(std::uint32_t) + sizeof(std::uint64_t) +
                        RotatorBlobBytes();
                 base += sizeof(std::uint8_t); // m_hasCentroid
-                if (m_Centroid != nullptr && m_hasCentroid == 1) {
-                    base += static_cast<std::uint64_t>(m_Dim) * sizeof(float);
+                if (m_rotCentroid != nullptr && m_hasCentroid > 0) {
+                    base += static_cast<std::uint64_t>(m_hasCentroid) * m_PaddedDim * sizeof(float);
                 }
                 return base;
             }
@@ -511,8 +508,9 @@ namespace SPTAG
                     IOBINARY(p_out, WriteBinary, blobBytes, (char*)rotBlob.data());
                 }
                 IOBINARY(p_out, WriteBinary, sizeof(std::uint8_t), (char*)&m_hasCentroid);
-                if (m_Centroid != nullptr && m_hasCentroid == 1) {
-                    IOBINARY(p_out, WriteBinary, sizeof(float) * m_Dim, (char*)m_Centroid->data());
+                if (m_rotCentroid != nullptr && m_hasCentroid > 0) {
+                    std::uint64_t bytes = static_cast<std::uint64_t>(m_hasCentroid) * m_PaddedDim * sizeof(float);
+                    IOBINARY(p_out, WriteBinary, bytes, (char*)m_rotCentroid->data());
                 }
                 return ErrorCode::Success;
             }
@@ -570,12 +568,13 @@ namespace SPTAG
                 if (ErrorCode::Success != DeserializeRotator(rotBlob)) return ErrorCode::Fail;
 
                 IOBINARY(p_in, ReadBinary, sizeof(std::uint8_t), (char*)&m_hasCentroid);
-                if (m_hasCentroid == 1) {
-                    m_Centroid.reset(new std::vector<float>(m_Dim));
-                    IOBINARY(p_in, ReadBinary, sizeof(float) * m_Dim, (char*)m_Centroid->data());
-                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "After read using centroid.\n");
+                if (m_hasCentroid > 0) {
+                    std::uint64_t bytes = static_cast<std::uint64_t>(m_hasCentroid) * m_PaddedDim * sizeof(float);
+                    m_rotCentroid.reset(new std::vector<float>(static_cast<size_t>(m_hasCentroid) * m_PaddedDim));
+                    IOBINARY(p_in, ReadBinary, bytes, (char*)m_rotCentroid->data());
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "After read using centroid %d.\n", m_hasCentroid);
                 } else {
-                    m_Centroid.reset();
+                    m_rotCentroid.reset();
                 }
 
                 RecalcSizes();
@@ -622,12 +621,13 @@ namespace SPTAG
 
                 m_hasCentroid = *ptr; 
                 ptr += sizeof(std::uint8_t);
-                if (m_hasCentroid == 1) {
-                    m_Centroid.reset(new std::vector<float>(m_Dim));
-                    std::memcpy(m_Centroid->data(), ptr, sizeof(float) * m_Dim);
-                    ptr += sizeof(float) * m_Dim;
+                if (m_hasCentroid > 0) {
+                    std::uint64_t bytes = static_cast<std::uint64_t>(m_hasCentroid) * m_PaddedDim * sizeof(float);
+                    m_rotCentroid.reset(new std::vector<float>(static_cast<size_t>(m_hasCentroid) * m_PaddedDim));
+                    std::memcpy(m_rotCentroid->data(), ptr, bytes);
+                    ptr += bytes;
                 } else {
-                    m_Centroid.reset();
+                    m_rotCentroid.reset();
                 }
                 
                 RecalcSizes();
@@ -641,17 +641,11 @@ namespace SPTAG
             }
 
             // 对查询向量做旋转与 padding 预处理
+            // 这一步现在不做中心化！！！
             void PreprocessQuery(const void* in_query, float* out_rotated) const
             {
                 std::vector<float> temp(m_Dim, 0.0f);
                 ConvertInputToFloat(reinterpret_cast<const T*>(in_query), temp.data());
-
-                if (m_Centroid != nullptr && m_Centroid->size() == m_Dim) {
-                    // 1) 查询向量也必须做同样的中心化
-                    for (DimensionType i = 0; i < m_Dim; ++i) {
-                        temp[i] -= (*m_Centroid)[i];
-                    }
-                }
 
                 if (m_Rotator) {
                     m_Rotator->rotate(temp.data(), out_rotated);
@@ -670,18 +664,17 @@ namespace SPTAG
                 const std::uint8_t* pY
             ) const
             {
-                const float* metaX = reinterpret_cast<const float*>(pX);
-                const float* metaY = reinterpret_cast<const float*>(pY);
+                const auto* metaX = reinterpret_cast<const RaBitQEstimateMeta*>(pX);
+                const auto* metaY = reinterpret_cast<const RaBitQEstimateMeta*>(pY);
 
-                __m512 vDeltaX = _mm512_set1_ps(metaX[0]);
-                __m512 vVLX    = _mm512_set1_ps(metaX[1]);
-                __m512 vDeltaY = _mm512_set1_ps(metaY[0]);
-                __m512 vVLY    = _mm512_set1_ps(metaY[1]);
+                __m512 vDeltaX = _mm512_set1_ps(metaX->delta);
+                __m512 vVLX    = _mm512_set1_ps(metaX->vl);
+                __m512 vDeltaY = _mm512_set1_ps(metaY->delta);
+                __m512 vVLY    = _mm512_set1_ps(metaY->vl);
 
                 const uint8_t* binX = reinterpret_cast<const uint8_t*>(pX + m_MetaSize);
                 const uint8_t* binY = reinterpret_cast<const uint8_t*>(pY + m_MetaSize);
 
-                // 【新增解压操作】：
                 std::vector<uint8_t> rawX(m_PaddedDim);
                 std::vector<uint8_t> rawY(m_PaddedDim);
                 UnpackVector(binX, rawX.data());
@@ -689,11 +682,21 @@ namespace SPTAG
                 const uint8_t* u_binX = rawX.data();
                 const uint8_t* u_binY = rawY.data();
 
+                const float* cX = nullptr;
+                const float* cY = nullptr;
+                if (m_hasCentroid > 0 && m_rotCentroid != nullptr) {
+                    if (metaX->centroid_id < m_hasCentroid) {
+                        cX = m_rotCentroid->data() + static_cast<size_t>(metaX->centroid_id) * m_PaddedDim;
+                    }
+                    if (metaY->centroid_id < m_hasCentroid) {
+                        cY = m_rotCentroid->data() + static_cast<size_t>(metaY->centroid_id) * m_PaddedDim;
+                    }
+                }
+
                 __m512 vDist = _mm512_setzero_ps();
                 DimensionType dim = m_PaddedDim;
                 DimensionType i = 0;
 
-                // AVX-512 Loop
                 for (; i + 15 < dim; i += 16) {
                     __m512i intX = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)(u_binX + i)));
                     __m512i intY = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)(u_binY + i)));
@@ -701,9 +704,17 @@ namespace SPTAG
                     __m512 fX = _mm512_cvtepi32_ps(intX);
                     __m512 fY = _mm512_cvtepi32_ps(intY);
 
-                    // Correct Reconstruction: val = code * delta + vl
                     fX = _mm512_fmadd_ps(fX, vDeltaX, vVLX);
                     fY = _mm512_fmadd_ps(fY, vDeltaY, vVLY);
+
+                    if (cX) {
+                        __m512 vcx = _mm512_loadu_ps(cX + i);
+                        fX = _mm512_add_ps(fX, vcx);
+                    }
+                    if (cY) {
+                        __m512 vcy = _mm512_loadu_ps(cY + i);
+                        fY = _mm512_add_ps(fY, vcy);
+                    }
 
                     __m512 diff = _mm512_sub_ps(fX, fY);
                     vDist = _mm512_fmadd_ps(diff, diff, vDist);
@@ -711,10 +722,11 @@ namespace SPTAG
 
                 float dist = _mm512_reduce_add_ps(vDist);
 
-                // Scalar Tail
                 for (; i < dim; ++i) {
-                    float valX = static_cast<float>(u_binX[i]) * metaX[0] + metaX[1];
-                    float valY = static_cast<float>(u_binY[i]) * metaY[0] + metaY[1];
+                    float valX = static_cast<float>(u_binX[i]) * metaX->delta + metaX->vl;
+                    float valY = static_cast<float>(u_binY[i]) * metaY->delta + metaY->vl;
+                    if (cX) valX += cX[i];
+                    if (cY) valY += cY[i];
                     float diff = valX - valY;
                     dist += diff * diff;
                 }
@@ -728,20 +740,34 @@ namespace SPTAG
                 const std::uint8_t* pY
             ) const
             {
-                const float* metaY = reinterpret_cast<const float*>(pY);
-                __m512 vDeltaY = _mm512_set1_ps(metaY[0]);
-                __m512 vVLY    = _mm512_set1_ps(metaY[1]);
+                const auto* metaY = reinterpret_cast<const RaBitQEstimateMeta*>(pY);
+                __m512 vDeltaY = _mm512_set1_ps(metaY->delta);
+                __m512 vVLY    = _mm512_set1_ps(metaY->vl);
                 const uint8_t* binY = reinterpret_cast<const uint8_t*>(pY + m_MetaSize);
+
+                const float* cc = nullptr;
+                std::vector<float> centered_query;
+                const float* qptr = rotated_query;
+
+                if (m_hasCentroid > 0 && m_rotCentroid != nullptr && metaY->centroid_id < m_hasCentroid) {
+                    cc = m_rotCentroid->data() + static_cast<size_t>(metaY->centroid_id) * m_PaddedDim;
+                    centered_query.resize(m_PaddedDim);
+                    for (DimensionType i = 0; i < m_PaddedDim; ++i) {
+                        centered_query[i] = rotated_query[i] - cc[i];
+                    }
+                    qptr = centered_query.data();
+                }
 
                 __m512 vDist = _mm512_setzero_ps();
                 DimensionType dim = m_PaddedDim;
                 DimensionType i = 0;
 
                 for (; i + 15 < dim; i += 16) {
-                    __m512 vX = _mm512_loadu_ps(rotated_query + i);
+                    __m512 vX = _mm512_loadu_ps(qptr + i);
                     __m512i intY = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)(binY + i)));
                     __m512 fY = _mm512_cvtepi32_ps(intY);
                     fY = _mm512_fmadd_ps(fY, vDeltaY, vVLY);
+
                     __m512 diff = _mm512_sub_ps(vX, fY);
                     vDist = _mm512_fmadd_ps(diff, diff, vDist);
                 }
@@ -749,8 +775,8 @@ namespace SPTAG
                 float dist = _mm512_reduce_add_ps(vDist);
 
                 for (; i < dim; ++i) {
-                    float valY = static_cast<float>(binY[i]) * metaY[0] + metaY[1];
-                    float diff = rotated_query[i] - valY;
+                    float valY = static_cast<float>(binY[i]) * metaY->delta + metaY->vl;
+                    float diff = qptr[i] - valY;
                     dist += diff * diff;
                 }
 
@@ -789,6 +815,114 @@ namespace SPTAG
             }
 
         private:
+            // 旋转输入向量，一般在内部Quantize时候用
+            inline void RotateInput(const T* vec, float* out_rotated) const
+            {
+                std::vector<float> temp(m_Dim);
+                ConvertInputToFloat(vec, temp.data());
+
+                if (m_Rotator) {
+                    m_Rotator->rotate(temp.data(), out_rotated);
+                } else {
+                    std::memcpy(out_rotated, temp.data(), m_Dim * sizeof(float));
+                    if (m_PaddedDim > m_Dim) {
+                        std::memset(out_rotated + m_Dim, 0, (m_PaddedDim - m_Dim) * sizeof(float));
+                    }
+                }
+            }
+
+            // 旋转后数据向量找到最近质心
+            inline std::uint8_t SelectNearestCentroid(const float* rotated_vec) const
+            {
+                if (m_hasCentroid == 0 || m_rotCentroid == nullptr) return 0;
+
+                const float* centroids = m_rotCentroid->data();
+                std::uint8_t best_id = 0;
+                float best_dist = std::numeric_limits<float>::max();
+
+                for (std::uint8_t c = 0; c < m_hasCentroid; ++c) {
+                    const float* cc = centroids + static_cast<size_t>(c) * m_PaddedDim;
+                    float dist = 0.0f;
+                    for (DimensionType d = 0; d < m_PaddedDim; ++d) {
+                        float diff = rotated_vec[d] - cc[d];
+                        dist += diff * diff;
+                    }
+                    if (dist < best_dist) {
+                        best_dist = dist;
+                        best_id = c;
+                    }
+                }
+                return best_id;
+            }
+
+            // kmeans聚类算法主体，目前是暴力计算，耗时可能较长
+            // 会完成m_hasCentroid/m_rotCentroid的设置
+            void RunKmeansRotCentroids(const T* data, SizeType num, std::uint8_t k)
+            {
+                if (k == 0 || num == 0) {
+                    m_rotCentroid.reset();
+                    m_hasCentroid = 0;
+                    return;
+                }
+                std::vector<std::uint8_t> vecCentroidId(num, 0);
+
+                k = static_cast<std::uint8_t>(std::min<SizeType>(k, num));
+                m_hasCentroid = k;
+
+                m_rotCentroid.reset(new std::vector<float>(static_cast<size_t>(k) * m_PaddedDim, 0.0f));
+                vecCentroidId.assign(num, 0);
+
+                // init: 均匀抽样初始化
+                for (std::uint8_t c = 0; c < k; ++c) {
+                    size_t idx = static_cast<size_t>(c) * static_cast<size_t>(num) / k;
+                    std::vector<float> rot(m_PaddedDim, 0.0f);
+                    RotateInput(reinterpret_cast<const T*>(data) + static_cast<size_t>(idx) * m_Dim, rot.data());
+                    std::memcpy(m_rotCentroid->data() + static_cast<size_t>(c) * m_PaddedDim,
+                                rot.data(), sizeof(float) * m_PaddedDim);
+                }
+
+                const int maxIters = 20;
+                std::vector<float> sum(static_cast<size_t>(k) * m_PaddedDim, 0.0f);
+                std::vector<SizeType> counts(k, 0);
+
+                for (int iter = 0; iter < maxIters; ++iter) {
+                    std::cout << "iter" << iter << "begin..." << std::endl;
+                    std::fill(sum.begin(), sum.end(), 0.0f);
+                    std::fill(counts.begin(), counts.end(), 0);
+
+                    SizeType changed = 0;
+                    std::vector<float> rot(m_PaddedDim, 0.0f);
+
+                    for (SizeType i = 0; i < num; ++i) {
+                        RotateInput(reinterpret_cast<const T*>(data) + static_cast<size_t>(i) * m_Dim, rot.data());
+
+                        std::uint8_t cid = SelectNearestCentroid(rot.data());
+                        if (vecCentroidId[i] != cid) {
+                            vecCentroidId[i] = cid;
+                            ++changed;
+                        }
+
+                        float* acc = sum.data() + static_cast<size_t>(cid) * m_PaddedDim;
+                        for (DimensionType d = 0; d < m_PaddedDim; ++d) {
+                            acc[d] += rot[d];
+                        }
+                        counts[cid] += 1;
+                    }
+
+                    for (std::uint8_t c = 0; c < k; ++c) {
+                        if (counts[c] == 0) continue;
+                        float inv = 1.0f / static_cast<float>(counts[c]);
+                        float* cc = m_rotCentroid->data() + static_cast<size_t>(c) * m_PaddedDim;
+                        const float* acc = sum.data() + static_cast<size_t>(c) * m_PaddedDim;
+                        for (DimensionType d = 0; d < m_PaddedDim; ++d) {
+                            cc[d] = acc[d] * inv;
+                        }
+                    }
+
+                    if (changed == 0) break;
+                }
+            }
+            
             // 将任意输入向量转换为 float 向量以统一后续计算
             inline void ConvertInputToFloat(const T* vec, float* out_float) const
             {
@@ -989,8 +1123,8 @@ namespace SPTAG
             RotatorStorageType m_RotatorType;
             PersistVersion m_FormatVersion;
 
-            std::uint8_t m_hasCentroid = 0; // 0 表示未启用质心，1 表示启用质心
-            std::unique_ptr<std::vector<float>> m_Centroid = nullptr; // 为空表示未启用质心
+            std::uint8_t m_hasCentroid = 0; // 0 表示未启用质心，>0 表示质心数量
+            std::unique_ptr<std::vector<float>> m_rotCentroid = nullptr; // 旋转后的质心，size = m_hasCentroid * m_PaddedDim
         };
     }
 }

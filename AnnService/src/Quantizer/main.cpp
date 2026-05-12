@@ -212,7 +212,7 @@ int main(int argc, char* argv[])
                 case VectorValueType::UInt8: {
                     auto rq = std::make_shared<COMMON::RaBitQQuantizer<std::uint8_t>>(options->m_dimension);
                     if (options->m_quantizedDim > 0) rq->SetBitsPerCode((SizeType)options->m_quantizedDim);
-                    rq->Train(set->GetData(), set->Count(), true);
+                    rq->Train(set->GetData(), set->Count(), 255);
                     std::cout << "TEST : setSize = " << set->Count() << std::endl;
                     quantizer = rq;
                     break;
