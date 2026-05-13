@@ -823,6 +823,21 @@ namespace SPTAG
                 cudaFreeHost(h_dist);
                 vectorSetRatio.reset();
 
+                // 测试 ////////////////////////////////////////////////////////////
+                if (p_opts.m_rerank > 0 && p_opts.m_resultNum > 0) {
+                    int printQ = std::min(numQueries, 5); // 可改成 1 / 10 / numQueries
+                    for (int qi = 0; qi < printQ; ++qi) {
+                        std::cout << "Q" << qi << " top10(after rerank):\n";
+                        int topN = std::min(10, results[qi].GetResultNum());
+                        for (int j = 0; j < topN; ++j) {
+                            auto r = results[qi].GetResult(j);
+                            if (r == nullptr || r->VID < 0) continue;
+                            std::cout << "  " << r->VID << "\t" << r->Dist << "\n";
+                        }
+                    }
+                }
+                ////////////////////////////////////////////////////////////////////
+
                 K = p_opts.m_rerank;    // m_rerank就是topK的K
 
                 std::shared_ptr<VectorSet> vectorSet;

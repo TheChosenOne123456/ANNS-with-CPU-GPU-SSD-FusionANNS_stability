@@ -1171,6 +1171,10 @@ BOOST_AUTO_TEST_CASE(RaBitQ_RealData_Recall_Top50)
         while (!heap.empty()) { topk.push_back(heap.top()); heap.pop(); }
         std::sort(topk.begin(), topk.end(), [](const Item& a, const Item& b){ return a.dist < b.dist; });
 
+        std::unordered_set<SPTAG::SizeType> topkIds;
+        topkIds.reserve(topk.size());
+        for (const auto& it : topk) topkIds.insert(it.id);
+
         int hit = 0;
         for (auto& it : topk) if (truth[qi].count(it.id)) ++hit;
         float recall = static_cast<float>(hit) / K;
@@ -1213,12 +1217,19 @@ BOOST_AUTO_TEST_CASE(RaBitQ_RealData_Recall_Top50)
         double lbGtRate = outN ? (100.0 * static_cast<double>(lbGtCount) / outN) : 0.0;
         double avgRelErr = outN ? (sumRelErr / outN) : 0.0;
 
+        size_t top10in50 = 0;
+        size_t top10N = std::min<size_t>(10, rows.size());
+        for (size_t i = 0; i < top10N; ++i) {
+            if (topkIds.count(rows[i].id)) ++top10in50;
+        }
+
         auto oldFlags = std::cout.flags();
         auto oldPrec = std::cout.precision();
         std::cout << "Q" << qi << " recall@50=" << recall
                   << std::fixed << std::setprecision(6)
                   << " lb>gt%=" << lbGtRate
                   << " avgRelErr=" << avgRelErr
+                  << " top10in50=" << top10in50
                   << "\n";
         std::cout.flags(oldFlags);
         std::cout.precision(oldPrec);

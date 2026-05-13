@@ -879,7 +879,9 @@ namespace SPTAG
                 int numvec = numVecPerPostinglist[postingID];
                 for (int vi = 0; vi < numvec; vi++)
                 {
-                    vectorIDs.push_back(postinglist[postingID][vi]);
+                    int vectorID = postinglist[postingID][vi];
+                    if (deduper.CheckAndSet(vectorID)) continue;
+                    vectorIDs.push_back(vectorID);
                 }
             }          
 
