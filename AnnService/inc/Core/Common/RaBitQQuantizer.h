@@ -123,6 +123,8 @@ namespace SPTAG
             }
 
             SizeType GetBitsPerCode() const { return m_BitsPerCode; }
+
+            std::uint8_t GetCentroidCount() const { return m_hasCentroid; }
             
             // 设置旋转器存储类型（影响 Save/Load 行为）
             void SetRotatorType(RotatorStorageType t) { m_RotatorType = t; }
@@ -146,27 +148,28 @@ namespace SPTAG
             };
 
             // 构建查询侧估算因子（对应论文公式里的 g_add / k1xsumq / g_error）
+            // 现在bond_meta相当于一个数组，支持多质心版本的查询预处理（如果有质心的话每个质心对应一套因子）
             inline void BuildL2EstimateQueryFactors(
                 const float* rotated_query,
-                BondMeta& bond_meta
+                BondMeta* bond_meta
             ) const
             {
-                float sumq = 0.0f;
-                float norm2 = 0.0f;
-                for (DimensionType i = 0; i < m_PaddedDim; ++i)  {
-                    float v = rotated_query[i];
-                    sumq += v;
-                    norm2 += v * v;
+                if (bond_meta == nullptr) return;
+
+                const std::uint8_t C = (m_hasCentroid > 0 && m_rotCentroid != nullptr) ? m_hasCentroid : 1;
+                for (std::uint8_t c = 0; c < C; ++c) {
+                    const float* qptr = rotated_query + static_cast<size_t>(c) * m_PaddedDim;
+                    float sumq = 0.0f;
+                    float norm2 = 0.0f;
+                    for (DimensionType i = 0; i < m_PaddedDim; ++i) {
+                        float v = qptr[i];
+                        sumq += v;
+                        norm2 += v * v;
+                    }
+                    bond_meta[c].g_add = norm2;
+                    bond_meta[c].k1xsumq = -0.5f * sumq;
+                    bond_meta[c].g_error = std::sqrt(std::max(0.0f, norm2));
                 }
-
-                // L2 下 g_add = ||q||^2
-                bond_meta.g_add = norm2;
-
-                // 与 rabitqlib::query.hpp 的 c1 一致: c1 = -((1<<1)-1)/2 = -0.5
-                bond_meta.k1xsumq = -0.5f * sumq;
-
-                // 误差界项里会乘 g_error（L2 下为 ||q||）
-                bond_meta.g_error = std::sqrt(std::max(0.0f, norm2));
             }
 
             // full_est_dist 需要的内积函数指针（float query vs uint8 code）
@@ -185,20 +188,24 @@ namespace SPTAG
                 const auto* meta = reinterpret_cast<const RaBitQEstimateMeta*>(pY);
                 const uint8_t* code = reinterpret_cast<const uint8_t*>(pY + m_MetaSize);
 
-                std::vector<float> centered_query;
-                const float* qptr = rotated_query;
-
+                std::uint8_t cid = 0;
                 if (m_hasCentroid > 0 && m_rotCentroid != nullptr && meta->centroid_id < m_hasCentroid) {
-                    centered_query.resize(m_PaddedDim);
-                    const float* cc = m_rotCentroid->data() + static_cast<size_t>(meta->centroid_id) * m_PaddedDim;
-                    for (DimensionType i = 0; i < m_PaddedDim; ++i) {
-                        centered_query[i] = rotated_query[i] - cc[i];
-                    }
-                    qptr = centered_query.data();
+                    cid = meta->centroid_id;
                 }
 
+                const float* qptr = rotated_query + static_cast<size_t>(cid) * m_PaddedDim;
+
+                float sumq = 0.0f;
+                float norm2 = 0.0f;
+                for (DimensionType i = 0; i < m_PaddedDim; ++i) {
+                    float v = qptr[i];
+                    sumq += v;
+                    norm2 += v * v;
+                }
                 BondMeta bond_meta;
-                BuildL2EstimateQueryFactors(qptr, bond_meta);
+                bond_meta.g_add = norm2;
+                bond_meta.k1xsumq = -0.5f * sumq;
+                bond_meta.g_error = std::sqrt(std::max(0.0f, norm2));
 
                 float est = rabitqlib::quant::full_est_dist<float, uint8_t>(
                     code,
@@ -212,7 +219,6 @@ namespace SPTAG
                     bond_meta.k1xsumq
                 );
 
-                // 论文式 lower bound（保守剪枝）
                 if (out_low_dist != nullptr) {
                     const float err_scale = static_cast<float>(1u << static_cast<unsigned>(m_BitsPerCode - 1));
                     float low = est - (meta->f_error * bond_meta.g_error) / err_scale;
@@ -222,43 +228,49 @@ namespace SPTAG
                 return est;
             }
 
-            // 重载，额外接收查询元信息以避免重复计算（多质心下废弃）
+            // 重载，额外接收查询元信息以避免重复计算
+            // 现在bond_meta都改为传入指针，后面接的对应修改调用方式
             inline float L2DistanceEstimate(
                 const float* rotated_query,
                 const std::uint8_t* pY,
-                const BondMeta bond_meta,
+                const BondMeta* bond_meta,
                 float* out_low_dist = nullptr
             ) const
             {
-                // 兼容 不建议使用了
-                return L2DistanceEstimate(rotated_query, pY, out_low_dist);
-                // const auto* meta = reinterpret_cast<const RaBitQEstimateMeta*>(pY);
-                // const uint8_t* code = reinterpret_cast<const uint8_t*>(pY + m_MetaSize);
+                if (bond_meta == nullptr) {
+                    return L2DistanceEstimate(rotated_query, pY, out_low_dist);
+                }
 
-                // float g_add = bond_meta.g_add;
-                // float k1xsumq = bond_meta.k1xsumq;
-                // float g_error = bond_meta.g_error;
+                const auto* meta = reinterpret_cast<const RaBitQEstimateMeta*>(pY);
+                const uint8_t* code = reinterpret_cast<const uint8_t*>(pY + m_MetaSize);
 
-                // float est = rabitqlib::quant::full_est_dist<float, uint8_t>(
-                //     code,
-                //     rotated_query,
-                //     m_PackedIpFunc,
-                //     m_PaddedDim,
-                //     m_BitsPerCode,
-                //     meta->f_add,
-                //     meta->f_rescale,
-                //     g_add,
-                //     k1xsumq
-                // );
+                std::uint8_t cid = 0;
+                if (m_hasCentroid > 0 && m_rotCentroid != nullptr && meta->centroid_id < m_hasCentroid) {
+                    cid = meta->centroid_id;
+                }
 
-                // // 论文式 lower bound（保守剪枝）
-                // if (out_low_dist != nullptr) {
-                //     const float err_scale = static_cast<float>(1u << static_cast<unsigned>(m_BitsPerCode - 1));
-                //     float low = est - (meta->f_error * g_error) / err_scale;
-                //     *out_low_dist = std::max(0.0f, low);
-                // }
+                const float* qptr = rotated_query + static_cast<size_t>(cid) * m_PaddedDim;
+                const BondMeta& bm = bond_meta[cid];
 
-                // return est;
+                float est = rabitqlib::quant::full_est_dist<float, uint8_t>(
+                    code,
+                    qptr,
+                    m_PackedIpFunc,
+                    m_PaddedDim,
+                    m_BitsPerCode,
+                    meta->f_add,
+                    meta->f_rescale,
+                    bm.g_add,
+                    bm.k1xsumq
+                );
+
+                if (out_low_dist != nullptr) {
+                    const float err_scale = static_cast<float>(1u << static_cast<unsigned>(m_BitsPerCode - 1));
+                    float low = est - (meta->f_error * bm.g_error) / err_scale;
+                    *out_low_dist = std::max(0.0f, low);
+                }
+
+                return est;
             }
 
             // 训练阶段仅用于选择旋转器和更新尺寸
@@ -641,19 +653,34 @@ namespace SPTAG
             }
 
             // 对查询向量做旋转与 padding 预处理
-            // 这一步现在不做中心化！！！
+            // 这一步现在不仅做中心化，还将所有可能的中心化都做了（如果有多个质心），以支持多质心版本的估算距离计算
+            // out_rotated 预期大小为 m_PaddedDim * m_hasCentroid（如果有质心）或 m_PaddedDim（无质心）
+            // 这可能在SSDIndex中GPU申请显存的时候要特别调整
             void PreprocessQuery(const void* in_query, float* out_rotated) const
             {
                 std::vector<float> temp(m_Dim, 0.0f);
                 ConvertInputToFloat(reinterpret_cast<const T*>(in_query), temp.data());
 
+                std::vector<float> rot(m_PaddedDim, 0.0f);
                 if (m_Rotator) {
-                    m_Rotator->rotate(temp.data(), out_rotated);
+                    m_Rotator->rotate(temp.data(), rot.data());
                 } else {
-                    std::memcpy(out_rotated, temp.data(), m_Dim * sizeof(float));
+                    std::memcpy(rot.data(), temp.data(), m_Dim * sizeof(float));
                     if (m_PaddedDim > m_Dim) {
-                        std::memset(out_rotated + m_Dim, 0, (m_PaddedDim - m_Dim) * sizeof(float));
+                        std::memset(rot.data() + m_Dim, 0, (m_PaddedDim - m_Dim) * sizeof(float));
                     }
+                }
+
+                if (m_hasCentroid > 0 && m_rotCentroid != nullptr) {
+                    for (std::uint8_t c = 0; c < m_hasCentroid; ++c) {
+                        float* dst = out_rotated + static_cast<size_t>(c) * m_PaddedDim;
+                        const float* cc = m_rotCentroid->data() + static_cast<size_t>(c) * m_PaddedDim;
+                        for (DimensionType d = 0; d < m_PaddedDim; ++d) {
+                            dst[d] = rot[d] - cc[d];
+                        }
+                    }
+                } else {
+                    std::memcpy(out_rotated, rot.data(), m_PaddedDim * sizeof(float));
                 }
             }
 
@@ -745,18 +772,11 @@ namespace SPTAG
                 __m512 vVLY    = _mm512_set1_ps(metaY->vl);
                 const uint8_t* binY = reinterpret_cast<const uint8_t*>(pY + m_MetaSize);
 
-                const float* cc = nullptr;
-                std::vector<float> centered_query;
-                const float* qptr = rotated_query;
-
+                std::uint8_t cid = 0;
                 if (m_hasCentroid > 0 && m_rotCentroid != nullptr && metaY->centroid_id < m_hasCentroid) {
-                    cc = m_rotCentroid->data() + static_cast<size_t>(metaY->centroid_id) * m_PaddedDim;
-                    centered_query.resize(m_PaddedDim);
-                    for (DimensionType i = 0; i < m_PaddedDim; ++i) {
-                        centered_query[i] = rotated_query[i] - cc[i];
-                    }
-                    qptr = centered_query.data();
+                    cid = metaY->centroid_id;
                 }
+                const float* qptr = rotated_query + static_cast<size_t>(cid) * m_PaddedDim;
 
                 __m512 vDist = _mm512_setzero_ps();
                 DimensionType dim = m_PaddedDim;
@@ -801,7 +821,7 @@ namespace SPTAG
             }
 
             // 重载，额外接收查询元信息以避免重复计算
-            virtual float L2Distance(const float* rotated_query, const std::uint8_t* pY, const BondMeta bond_meta, float* out_low_dist = nullptr) const
+            virtual float L2Distance(const float* rotated_query, const std::uint8_t* pY, const BondMeta *bond_meta, float* out_low_dist = nullptr) const
             {
                 return L2DistanceEstimate(rotated_query, pY, bond_meta, out_low_dist);
             }
@@ -809,7 +829,8 @@ namespace SPTAG
             // 兼容入口：先预处理查询，再走估算
             virtual float L2Distance(const void* pX, const std::uint8_t* pY) const
             {
-                std::vector<float> temp_rot(m_PaddedDim);
+                const size_t C = (m_hasCentroid > 0 && m_rotCentroid != nullptr) ? m_hasCentroid : 1;
+                std::vector<float> temp_rot(static_cast<size_t>(C) * m_PaddedDim);
                 PreprocessQuery(reinterpret_cast<const T*>(pX), temp_rot.data());
                 return L2Distance(temp_rot.data(), pY);
             }
@@ -886,11 +907,12 @@ namespace SPTAG
                 std::vector<SizeType> counts(k, 0);
 
                 for (int iter = 0; iter < maxIters; ++iter) {
-                    std::cout << "iter" << iter << "begin..." << std::endl;
+                    // std::cout << "iter" << iter << "begin..." << std::endl; // 可以保留或省略
                     std::fill(sum.begin(), sum.end(), 0.0f);
                     std::fill(counts.begin(), counts.end(), 0);
 
                     SizeType changed = 0;
+                    double iter_loss = 0.0; // 【新增】用于统计当前的聚类误差平方和 (SSE)
                     std::vector<float> rot(m_PaddedDim, 0.0f);
 
                     for (SizeType i = 0; i < num; ++i) {
@@ -902,6 +924,16 @@ namespace SPTAG
                             ++changed;
                         }
 
+                        // 【新增】计算并累加当前点到分配质心的距离
+                        const float* cc = m_rotCentroid->data() + static_cast<size_t>(cid) * m_PaddedDim;
+                        float dist = 0.0f;
+                        for (DimensionType d = 0; d < m_PaddedDim; ++d) {
+                            float diff = rot[d] - cc[d];
+                            dist += diff * diff;
+                        }
+                        iter_loss += dist; 
+
+                        // 累加计算新质心
                         float* acc = sum.data() + static_cast<size_t>(cid) * m_PaddedDim;
                         for (DimensionType d = 0; d < m_PaddedDim; ++d) {
                             acc[d] += rot[d];
@@ -909,6 +941,7 @@ namespace SPTAG
                         counts[cid] += 1;
                     }
 
+                    // 更新质心
                     for (std::uint8_t c = 0; c < k; ++c) {
                         if (counts[c] == 0) continue;
                         float inv = 1.0f / static_cast<float>(counts[c]);
@@ -918,6 +951,11 @@ namespace SPTAG
                             cc[d] = acc[d] * inv;
                         }
                     }
+
+                    // 【新增】在每个 iter 末尾打印优化指标
+                    std::cout << "Iter " << iter 
+                              << " | Loss (SSE): " << iter_loss 
+                              << " | Changed points: " << changed << std::endl;
 
                     if (changed == 0) break;
                 }

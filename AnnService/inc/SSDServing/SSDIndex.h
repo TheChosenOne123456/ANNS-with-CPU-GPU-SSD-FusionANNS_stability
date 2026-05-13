@@ -344,6 +344,7 @@ namespace SPTAG
                                 // 这里我们自己当场通过 RaBitQQuantizer 算出 rotated_query 和 meta。
                                 const ValueType* target = reinterpret_cast<const ValueType*>(p_results[index].GetTarget());
 
+                                // 以后要开m_hasCentroid倍大小的数组来支撑
                                 std::vector<float> rotated_query(paddedDim, 0.0f);
                                 
                                 quantizer->PreprocessQuery(target, rotated_query.data());
