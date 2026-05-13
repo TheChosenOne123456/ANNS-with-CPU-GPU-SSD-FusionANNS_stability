@@ -1175,8 +1175,6 @@ BOOST_AUTO_TEST_CASE(RaBitQ_RealData_Recall_Top50)
         for (auto& it : topk) if (truth[qi].count(it.id)) ++hit;
         float recall = static_cast<float>(hit) / K;
 
-        std::cout << "Q" << qi << " recall@50=" << recall << "\n";
-
         std::vector<Row> rows;
         rows.reserve(truth[qi].size());
 
@@ -1202,6 +1200,28 @@ BOOST_AUTO_TEST_CASE(RaBitQ_RealData_Recall_Top50)
                   [](const Row& a, const Row& b) { return a.trueDist < b.trueDist; });
 
         const size_t outN = std::min<size_t>(K, rows.size());
+
+        size_t lbGtCount = 0;
+        double sumRelErr = 0.0;
+        for (size_t i = 0; i < outN; ++i) {
+            const auto& r = rows[i];
+            if (r.lowBound > r.trueDist) ++lbGtCount;
+            if (r.trueDist > 0.0f) {
+                sumRelErr += std::abs(r.estDist - r.trueDist) / r.trueDist;
+            }
+        }
+        double lbGtRate = outN ? (100.0 * static_cast<double>(lbGtCount) / outN) : 0.0;
+        double avgRelErr = outN ? (sumRelErr / outN) : 0.0;
+
+        auto oldFlags = std::cout.flags();
+        auto oldPrec = std::cout.precision();
+        std::cout << "Q" << qi << " recall@50=" << recall
+                  << std::fixed << std::setprecision(6)
+                  << " lb>gt%=" << lbGtRate
+                  << " avgRelErr=" << avgRelErr
+                  << "\n";
+        std::cout.flags(oldFlags);
+        std::cout.precision(oldPrec);
 
         std::cout << std::left
                   << std::setw(12) << "ID"

@@ -137,7 +137,7 @@ namespace SPTAG
                 float f_rescale;
                 float f_error;
                 std::uint8_t centroid_id;
-                // std::uint8_t _reserved[3]; // 维持 4-byte 对齐
+                std::uint8_t _reserved[3]; // 维持 4-byte 对齐
             };
 
             // 查询向量的元信息，和理论误差界限的计算相关

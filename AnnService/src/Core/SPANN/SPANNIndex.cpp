@@ -801,10 +801,10 @@ namespace SPTAG
             std::vector<int>& numVecPerPostinglist, 
             std::vector<std::unique_ptr<int[]>>& postinglist, 
             void* d_QuantizedVectorSet, 
-            float *d_rotated_query,         // 指向 GPU 显存上某个区块的旋转指针
-            float g_add,     // bond_meta
-            float k1xsumq,  //bond_meta
-            float g_error,  //bond_meta
+            float *d_rotated_queries,      // 【修改：变成含所有质心的游标起点】
+            float *d_g_adds,               // 【改名，变成浮点数组的起手】
+            float *d_k1xsumqs,
+            float *d_g_errors,
             int* d_vectorIDs, 
             float *d_dist, 
             float *h_dist, 
@@ -894,11 +894,11 @@ namespace SPTAG
             float *dist_temp = d_dist + totalNumVec * threadOrder;
             cudaMemset(dist_temp, 0, sizeof(float) * numVector);
 
-            // 转换外部类型结构体为 GPU 底层支持的结构，避免名字空间耦合 (可依据你在 process.h 怎么定义进行匹配)
-            BondMetaMetaGPU bond_meta_gpu;
-            bond_meta_gpu.g_add = g_add;
-            bond_meta_gpu.k1xsumq = k1xsumq;
-            bond_meta_gpu.g_error = g_error;
+            // // 转换外部类型结构体为 GPU 底层支持的结构，避免名字空间耦合 (可依据你在 process.h 怎么定义进行匹配)
+            // BondMetaMetaGPU bond_meta_gpu;
+            // bond_meta_gpu.g_add = g_add;
+            // bond_meta_gpu.k1xsumq = k1xsumq;
+            // bond_meta_gpu.g_error = g_error;
 
             // 准备 GPU 专属的 local memory 空间存放 rotated_query (或者也可以从外层函数拷贝好这里直接用指针)
             // 假定 d_rotated_query 已经包含了 CPU -> GPU 的 cudaMemcpy！(这里假设在 SSDIndex 调度层已经拷贝过)
@@ -906,8 +906,10 @@ namespace SPTAG
             computeRaBitQDistanceWithGPU(
                 d_QuantizedVectorSet, 
                 vectorID_temp, 
-                d_rotated_query, 
-                bond_meta_gpu, 
+                d_rotated_queries, 
+                d_g_adds,      // 透传这三个给 GPU，让 GPU 内核自己抓取
+                d_k1xsumqs,
+                d_g_errors, 
                 dist_temp, 
                 dim, 
                 bits_per_code,      // RaBitQ 专属参数：告知核函数步长
@@ -959,37 +961,37 @@ namespace SPTAG
 
                 cudaMemcpy(
                     h_query.data(),
-                    d_rotated_query,
+                    d_rotated_queries,
                     sizeof(float) * dim,
                     cudaMemcpyDeviceToHost
                 );
 
-                const float* meta = reinterpret_cast<const float*>(h_vec.data()); // [0]=f_add [1]=f_rescale [2]=f_error
-                const uint8_t* code = h_vec.data() + metaBytes;
+                // const float* meta = reinterpret_cast<const float*>(h_vec.data()); // [0]=f_add [1]=f_rescale [2]=f_error
+                // const uint8_t* code = h_vec.data() + metaBytes;
 
-                auto ipFunc = rabitqlib::select_excode_ipfunc(bits_per_code);
+                // auto ipFunc = rabitqlib::select_excode_ipfunc(bits_per_code);
 
-                float est_lib = rabitqlib::quant::full_est_dist<float, uint8_t>(
-                    code,
-                    h_query.data(),
-                    ipFunc,
-                    dim,
-                    bits_per_code,
-                    meta[0],      // f_add
-                    meta[1],      // f_rescale
-                    g_add,
-                    k1xsumq
-                );
+                // float est_lib = rabitqlib::quant::full_est_dist<float, uint8_t>(
+                //     code,
+                //     h_query.data(),
+                //     ipFunc,
+                //     dim,
+                //     bits_per_code,
+                //     meta[0],      // f_add
+                //     meta[1],      // f_rescale
+                //     g_add,
+                //     k1xsumq
+                // );
 
-                const float err_scale = static_cast<float>(1u << static_cast<unsigned>(bits_per_code - 1));
-                const float low_lib = std::max(0.0f, est_lib - (meta[2] * g_error) / err_scale);
-                float est_gpu = h_dist_temp[0];
+                // const float err_scale = static_cast<float>(1u << static_cast<unsigned>(bits_per_code - 1));
+                // const float low_lib = std::max(0.0f, est_lib - (meta[2] * g_error) / err_scale);
+                // float est_gpu = h_dist_temp[0];
 
-                SPTAGLIB_LOG(
-                    Helper::LogLevel::LL_Info,
-                    "TEST CPUvsGPU: vid=%d gpu_est=%f lib_est=%f diff=%f lib_low=%f limit=%f\n",
-                    vid0, est_gpu, est_lib, std::abs(est_gpu - est_lib), low_lib, limitDist
-                );
+                // SPTAGLIB_LOG(
+                //     Helper::LogLevel::LL_Info,
+                //     "TEST CPUvsGPU: vid=%d gpu_est=%f lib_est=%f diff=%f lib_low=%f limit=%f\n",
+                //     vid0, est_gpu, est_lib, std::abs(est_gpu - est_lib), low_lib, limitDist
+                // );
             }
             ///////////////////////////////////////////////////////////////////////////////////
 

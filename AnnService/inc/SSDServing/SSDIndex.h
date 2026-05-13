@@ -293,6 +293,9 @@ namespace SPTAG
                 std::vector<std::unique_ptr<int[]>>& postinglist, 
                 void* d_QuantizedVectorSet,
                 float *d_rotated_query,     // GPU上存放的每条查询单独的 rotated_query，替换掉了 d_table
+                float* d_g_adds,     // 【新增】
+                float* d_k1xsumqs,   // 【新增】
+                float* d_g_errors,   // 【新增】
                 int* d_vectorIDs, 
                 float *d_dist, 
                 float *h_dist, 
@@ -345,13 +348,24 @@ namespace SPTAG
                                 const ValueType* target = reinterpret_cast<const ValueType*>(p_results[index].GetTarget());
 
                                 // 以后要开m_hasCentroid倍大小的数组来支撑
-                                std::vector<float> rotated_query(paddedDim, 0.0f);
+                                int C = (quantizer->GetCentroidCount() > 0) ? quantizer->GetCentroidCount() : 1;
+                                std::vector<float> rotated_query(paddedDim * C, 0.0f);
                                 
                                 quantizer->PreprocessQuery(target, rotated_query.data());
                                 // 测试
-                                if (!isWarmup && index == 0 && i == 0) SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "TEST : rotated_query0=%f\n", rotated_query[0]);
-                                typename COMMON::RaBitQQuantizer<ValueType>::BondMeta bond_meta;
-                                quantizer->BuildL2EstimateQueryFactors(rotated_query.data(), bond_meta);
+                                // if (!isWarmup && index == 0 && i == 0) SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "TEST : rotated_query0=%f\n", rotated_query[0]);
+                                std::vector<typename COMMON::RaBitQQuantizer<ValueType>::BondMeta> tmp_bond_metas(C);
+                                quantizer->BuildL2EstimateQueryFactors(rotated_query.data(), tmp_bond_metas.data());
+
+                                // 因为我们需要以结构体数组的形式算，但显存是分离数组，所以在这里拆分：
+                                std::vector<float> tmp_g_adds(C);
+                                std::vector<float> tmp_k1xsumqs(C);
+                                std::vector<float> tmp_g_errors(C);
+                                for (int c = 0; c < C; ++c) {
+                                    tmp_g_adds[c]   = tmp_bond_metas[c].g_add;
+                                    tmp_k1xsumqs[c] = tmp_bond_metas[c].k1xsumq;
+                                    tmp_g_errors[c] = tmp_bond_metas[c].g_error;
+                                }
 
                                 std::unordered_set<int> postingIDSet;   // 记录访问过的向量 ID
 
@@ -361,10 +375,16 @@ namespace SPTAG
                                     SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "TEST : B RaBitQ+GPU search\n");
                                 if(p_opts.m_enableGPU)
                                 {
-                                    // 1. 将当前查询算好的 rotated_query 发往 GPU。
-                                    // 每个线程通过 threadOrder(`i`) 独占一块 `actualPaddedDim` 长度的显存，互不干扰
-                                    float* current_gpu_query = d_rotated_query + i * paddedDim;
-                                    cudaMemcpy(current_gpu_query, rotated_query.data(), paddedDim * sizeof(float), cudaMemcpyHostToDevice);
+                                    // 1. 将数据分别拷入本线程该分配的区块中去
+                                    float* cur_d_query   = d_rotated_query + i * paddedDim * C;
+                                    float* cur_d_gadd    = d_g_adds + i * C;
+                                    float* cur_d_k1x     = d_k1xsumqs + i * C;
+                                    float* cur_d_gerr    = d_g_errors + i * C;
+
+                                    cudaMemcpy(cur_d_query, rotated_query.data(), paddedDim * C * sizeof(float), cudaMemcpyHostToDevice);
+                                    cudaMemcpy(cur_d_gadd, tmp_g_adds.data(), C * sizeof(float), cudaMemcpyHostToDevice);
+                                    cudaMemcpy(cur_d_k1x, tmp_k1xsumqs.data(), C * sizeof(float), cudaMemcpyHostToDevice);
+                                    cudaMemcpy(cur_d_gerr, tmp_g_errors.data(), C * sizeof(float), cudaMemcpyHostToDevice);
 
                                     // 2. 调用我们在 SPANNIndex.cpp 写的 SearchRaBitQIndex_GPU 分支
                                     p_index->SearchRaBitQIndex_GPU(
@@ -375,10 +395,10 @@ namespace SPTAG
                                         numVecPerPostinglist, 
                                         postinglist, 
                                         d_QuantizedVectorSet, 
-                                        current_gpu_query,      // 纯净的指针
-                                        bond_meta.g_add,        // 【修改】：拆成三个 float 传入
-                                        bond_meta.k1xsumq,
-                                        bond_meta.g_error,
+                                        cur_d_query, 
+                                        cur_d_gadd,
+                                        cur_d_k1x,
+                                        cur_d_gerr,
                                         d_vectorIDs, 
                                         d_dist, 
                                         h_dist, 
@@ -529,8 +549,8 @@ namespace SPTAG
                         const size_t paddedDim = static_cast<size_t>(rabitq_quantizer->GetPaddedDim());
                         const size_t bitsPerCode = static_cast<size_t>(rabitq_quantizer->GetBitsPerCode());
 
-                        const size_t cpuMetaBytes = 5 * sizeof(float);
-                        const size_t gpuMetaBytes = 3 * sizeof(float);
+                        const size_t cpuMetaBytes = 6 * sizeof(float);
+                        const size_t gpuMetaBytes = 4 * sizeof(float);
                         const size_t codeBytes = (paddedDim * bitsPerCode + 7) / 8;
                         const size_t cpuBytesPerVec = rabitq_quantizer->QuantizeSize();
                         const size_t gpuBytesPerVec = gpuMetaBytes + codeBytes; // GPU中每个向量占的字节数
@@ -655,23 +675,39 @@ namespace SPTAG
                 
                 // 根据量化器类型分别声明不同用途的 GPU 内存指针
                 uint8_t *d_table = nullptr; 
-                float *d_rotated_query = nullptr; 
-                // std::shared_ptr<SPTAG::COMMON::RaBitQQuantizer<ValueType>> rabitq_quantizer = nullptr;
+                float *d_rotated_query = nullptr;                 
 
                 // --- 核心改动：直接通过 == 判断类型并分配由于算法不同导致所需的不同显存 ---
+                float *d_g_adds = nullptr;
+                float *d_k1xsumqs = nullptr;
+                float *d_g_errors = nullptr;
+                int C = 1; // 质心数量，后面再按真实值赋值
                 if (quantizer->GetQuantizerType() == QuantizerType::RaBitQQuantizer)
                 {
                     // rabitq_quantizer = std::dynamic_pointer_cast<SPTAG::COMMON::RaBitQQuantizer<ValueType>>(quantizer);
-                    int paddedDim = rabitq_quantizer->GetPaddedDim(); // 使用你新加的 public 接口
+                    int paddedDim = rabitq_quantizer->GetPaddedDim(); 
+                    // 【新增】读取真实的质心数
+                    C = (rabitq_quantizer->GetCentroidCount() > 0) ? rabitq_quantizer->GetCentroidCount() : 1;
                     
                     // RaBitQ 不需要查表，只需要每条线程存放其旋转和补齐后的查询向量
-                    size_t rotatedBytes = sizeof(float) * paddedDim * numThreads;
+                    // 重要修复，查询向量是一组不同中心化后旋转的值
+                    size_t rotatedBytes = C * sizeof(float) * paddedDim * numThreads;
                     std::cout << "TEST : asking for " << (rotatedBytes / 1024.0 / 1024.0)
                             << " MIB from GPU for d_rotated_query!" << std::endl;
                     cudaMalloc((void **)&d_rotated_query, rotatedBytes);
+
+                    // 【新增】分配所有查询可能用到的 bond_meta 的数组空间
+                    size_t bondBytes = sizeof(float) * C * numThreads;
+                    std::cout << "TEST : asking for bond metas (g_add, k1xsumq, g_error) 3 * " 
+                              << (bondBytes / 1024.0 / 1024.0) << " MIB from GPU!" << std::endl;
+                    cudaMalloc((void **)&d_g_adds, bondBytes);
+                    cudaMalloc((void **)&d_k1xsumqs, bondBytes);
+                    cudaMalloc((void **)&d_g_errors, bondBytes);
                 }
                 else
                 {
+                    std::cout << "TEST : asking for " << (256 * dim * sizeof(float) * numThreads / 1024.0 / 1024.0)
+                            << " MIB from GPU for d_table!" << std::endl;
                     // 原始 PQ 模式：存放每个查询的 ADC 查表，分块长度是 256（centroids）× dim
                     cudaMalloc((void **)&d_table, 256 * dim * sizeof(float) * numThreads);
                 }
@@ -722,7 +758,9 @@ namespace SPTAG
                     if (quantizer->GetQuantizerType() == QuantizerType::RaBitQQuantizer) 
                     {
                         SearchSequentialRaBitQVersion(p_index, numThreads, warmupResults, warmpUpStats, p_opts.m_queryCountLimit, internalResultNum, warmupQuerySet, QuantizedVectorSet,
-                        vectorSetRatio, rabitq_quantizer->GetPaddedDim(), rabitq_quantizer->GetBitsPerCode(), numvec, postinglist, d_QuantizedVectorSet, d_rotated_query, d_vectorIDs, d_dist, h_dist, totalNumVec, rabitq_quantizer, isWarmup);
+                            vectorSetRatio, rabitq_quantizer->GetPaddedDim(), rabitq_quantizer->GetBitsPerCode(), numvec, postinglist, d_QuantizedVectorSet, d_rotated_query, 
+                            d_g_adds, d_k1xsumqs, d_g_errors, 
+                            d_vectorIDs, d_dist, h_dist, totalNumVec, rabitq_quantizer, isWarmup);
                     }
                     else if (quantizer->GetQuantizerType() == QuantizerType::PQQuantizer)
                     {
@@ -761,7 +799,9 @@ namespace SPTAG
                     // 测试
                     // std::cout << "Using RaBitQQuantizer for search" << std::endl;
                     SearchSequentialRaBitQVersion(p_index, numThreads, results, stats, p_opts.m_queryCountLimit, internalResultNum, querySet, QuantizedVectorSet,
-                    vectorSetRatio, dim, rabitq_quantizer->GetBitsPerCode(), numvec, postinglist, d_QuantizedVectorSet, d_rotated_query, d_vectorIDs, d_dist, h_dist, totalNumVec, rabitq_quantizer, isWarmup);
+                        vectorSetRatio, rabitq_quantizer->GetPaddedDim(), rabitq_quantizer->GetBitsPerCode(), numvec, postinglist, d_QuantizedVectorSet, d_rotated_query, 
+                        d_g_adds, d_k1xsumqs, d_g_errors,
+                        d_vectorIDs, d_dist, h_dist, totalNumVec, rabitq_quantizer, isWarmup);
                 }
                 else
                 {
@@ -774,6 +814,9 @@ namespace SPTAG
                 // 释放显存
                 if (d_table != nullptr) cudaFree(d_table);
                 if (d_rotated_query != nullptr) cudaFree(d_rotated_query);
+                if (d_g_adds != nullptr) cudaFree(d_g_adds);
+                if (d_k1xsumqs != nullptr) cudaFree(d_k1xsumqs);
+                if (d_g_errors != nullptr) cudaFree(d_g_errors);    // 新增
 
                 cudaFree(d_vectorIDs);
                 cudaFree(d_dist);

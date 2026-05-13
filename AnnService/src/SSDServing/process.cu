@@ -279,8 +279,10 @@ __device__ float cuda_rabitq_full_est_dist(
 __global__ void ProcessRaBitQ(
     void     *d_QuantizedVectorSet, 
     int      *d_vectorIDs, 
-    float    *d_rotated_query, 
-    BondMetaMetaGPU bond_meta,  // (注意这里名字定义为了避免与头文件冲突，可以在头文件定义传入)
+    float    *d_rotated_queries,   // 【修改】指针
+    float    *d_g_adds,
+    float    *d_k1xsumqs,
+    float    *d_g_errors,
     float    *d_dist, 
     int       dim, 
     int       bits_per_code, // 【新增传入】告诉 GPU 当前是几 Bit 重建
@@ -296,7 +298,7 @@ __global__ void ProcessRaBitQ(
             // RaBitQ 数据结构：
             // 前 5 个 float 是 Meta (delta, vl, f_add, f_rescale, f_error)，占用 20 个字节
             // 后面紧接着才是 Quantized Code。
-            int meta_size = 3 * sizeof(float);  // 去掉delta和vl
+            int meta_size = 3 * sizeof(float) + 4;  // 【注意】要加上 centroid_id(1 byte) 占用的空间，这里需要跟你实际打包对齐！假设这里是正确的起点
             // 计算 packed 占用的字节数（向上取整）
             int code_bytes = (dim * bits_per_code + 7) / 8;
             int total_bytes_per_vec = meta_size + code_bytes;
@@ -310,6 +312,15 @@ __global__ void ProcessRaBitQ(
             float f_add     = meta_ptr[0];
             float f_rescale = meta_ptr[1];
             float f_error   = meta_ptr[2];
+
+            // 【新增】读取 centroid_id
+            uint8_t centroid_id = pY[3 * sizeof(float)]; // 假设 centroid_id 紧跟在 f_error 后
+            
+            // 【新增】根据 centroid_id 取出对应的查询与 bond_meta
+            float* cur_query = d_rotated_queries + centroid_id * dim;
+            float g_add   = d_g_adds[centroid_id];
+            float k1xsumq = d_k1xsumqs[centroid_id];
+            float g_error = d_g_errors[centroid_id];
 
             // Code 区间的起始指针
             uint8_t* code_ptr = pY + meta_size;
@@ -329,13 +340,13 @@ __global__ void ProcessRaBitQ(
 
             // 1. 调用上方写的 GPU 版全预估距离函数 (等价于 CPU 的 L2DistanceEstimate)
             float estimateDist = cuda_rabitq_full_est_dist(
-                code_ptr, d_rotated_query, dim, bits_per_code, 
-                f_add, f_rescale, bond_meta.g_add, bond_meta.k1xsumq
+                code_ptr, cur_query, dim, bits_per_code, 
+                f_add, f_rescale, g_add, k1xsumq
             );
 
             // 2. 计算误差下限 (用于保守剪枝)
             const float err_scale = static_cast<float>(1u << static_cast<unsigned>(bits_per_code - 1));
-            float low_dist = estimateDist - (f_error * bond_meta.g_error) / err_scale;
+            float low_dist = estimateDist - (f_error * g_error) / err_scale;
 
             // 3. 剪枝策略！这是融合进 GPU 的精髓。
             if (low_dist > limitDist) {
@@ -357,8 +368,10 @@ __global__ void ProcessRaBitQ(
 void computeRaBitQDistanceWithGPU(
     void     *d_QuantizedVectorSet, 
     int      *d_vectorIDs, 
-    float    *d_rotated_query, 
-    BondMetaMetaGPU bond_meta, 
+    float    *d_rotated_queries,  // 【修改】
+    float    *d_g_adds,     // 分开传
+    float    *d_k1xsumqs,
+    float    *d_g_errors, 
     float    *d_dist, 
     int       dim, 
     int       bits_per_code, 
@@ -375,8 +388,10 @@ void computeRaBitQDistanceWithGPU(
     ProcessRaBitQ<<<grid, block>>>(
         d_QuantizedVectorSet, 
         d_vectorIDs, 
-        d_rotated_query, 
-        bond_meta, 
+        d_rotated_queries, 
+        d_g_adds,          // 传入分开的参数
+        d_k1xsumqs,
+        d_g_errors,
         d_dist, 
         dim, 
         bits_per_code, 

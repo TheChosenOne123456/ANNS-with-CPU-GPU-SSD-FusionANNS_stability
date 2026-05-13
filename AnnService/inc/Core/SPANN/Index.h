@@ -159,10 +159,10 @@ namespace SPTAG
                 std::vector<int>& numVecPerPostinglist, 
                 std::vector<std::unique_ptr<int[]>>& postinglist, 
                 void* d_QuantizedVectorSet, 
-                float* d_rotated_query,         
-                float g_add,     // bond_meta
-                float k1xsumq,  // bond_meta
-                float g_error,  // bond_meta
+                float *d_rotated_queries,
+                float *d_g_adds,     // 修改为 float*
+                float *d_k1xsumqs,   // 修改为 float*
+                float *d_g_errors,   // 修改为 float*
                 int* d_vectorIDs, 
                 float* d_dist, 
                 float* h_dist, 
